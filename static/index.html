@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>智能旅行助手</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="app-shell">
+    <section id="formPage" class="page page-active">
+      <div class="home-shell">
+        <header class="home-header">
+          <div class="brand-mark">TA</div>
+          <div class="home-title-block">
+            <div class="eyebrow">Travel Agent Console</div>
+            <h1>智能旅行助手</h1>
+            <p class="lead">输入城市、日期、预算、偏好和出行方式，生成一份可解释、可落地的旅行计划。</p>
+          </div>
+        </header>
+
+        <form id="travelForm" class="planner-form">
+          <section class="form-section">
+            <div class="section-header">
+              <div>
+                <div class="section-kicker">Step 01</div>
+                <h2>目的地与日期</h2>
+              </div>
+              <span class="section-tag">基础信息</span>
+            </div>
+
+            <div class="form-grid destination-grid">
+              <label class="field field-city">
+                <span>旅行城市</span>
+                <input type="text" id="city" placeholder="例如：广州、汕头、Beijing" required>
+              </label>
+              <label class="field">
+                <span>开始日期</span>
+                <input type="date" id="startDate" required>
+              </label>
+              <label class="field">
+                <span>结束日期</span>
+                <input type="date" id="endDate" required>
+              </label>
+            </div>
+          </section>
+
+          <section class="form-section">
+            <div class="section-header">
+              <div>
+                <div class="section-kicker">Step 02</div>
+                <h2>预算与偏好</h2>
+              </div>
+              <span class="section-tag">筛选条件</span>
+            </div>
+
+            <div class="form-grid two">
+              <label class="field">
+                <span>最低预算</span>
+                <input type="number" id="budgetMin" min="100" value="1200" required>
+              </label>
+              <label class="field">
+                <span>最高预算</span>
+                <input type="number" id="budgetMax" min="100" value="2500" required>
+              </label>
+            </div>
+
+            <label class="field">
+              <span>旅行偏好</span>
+              <div class="chips" id="preferenceChips"></div>
+            </label>
+
+            <div class="form-grid two text-grid">
+              <label class="field">
+                <span>补充偏好</span>
+                <textarea id="extraPreferences" rows="4" placeholder="例如：喜欢爬山，想玩水，想逛古镇，偏好轻松 city walk"></textarea>
+              </label>
+
+              <label class="field">
+                <span>忌讳</span>
+                <textarea id="taboos" rows="4" placeholder="例如：不吃辣，不想爬山，不去过于拥挤的地方"></textarea>
+              </label>
+            </div>
+          </section>
+
+          <section class="form-section">
+            <div class="section-header">
+              <div>
+                <div class="section-kicker">Step 03</div>
+                <h2>行程设置</h2>
+              </div>
+              <span class="section-tag">执行策略</span>
+            </div>
+
+            <div class="form-grid three">
+              <label class="field">
+                <span>同行人数</span>
+                <input type="number" id="travelers" min="1" max="10" value="2" required>
+              </label>
+              <label class="field">
+                <span>旅行节奏</span>
+                <select id="pace">
+                  <option value="relaxed">慢游</option>
+                  <option value="balanced" selected>平衡</option>
+                  <option value="intense">紧凑</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>住宿偏好</span>
+                <select id="hotelStyle">
+                  <option value="budget">经济</option>
+                  <option value="comfort" selected>舒适</option>
+                  <option value="premium">高档</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="form-grid two">
+              <label class="field">
+                <span>出行方式</span>
+                <select id="transportMode">
+                  <option value="public_transit" selected>公共交通</option>
+                  <option value="self_drive">自驾游</option>
+                  <option value="taxi">打车</option>
+                  <option value="mixed">混合出行</option>
+                </select>
+              </label>
+
+              <label class="field" id="transitPreferenceWrap">
+                <span>公共交通偏好</span>
+                <select id="transitPreference">
+                  <option value="recommended" selected>推荐</option>
+                  <option value="less_walking">步行时间少</option>
+                  <option value="subway_priority">地铁优先</option>
+                  <option value="bus_priority">公交优先</option>
+                </select>
+              </label>
+            </div>
+          </section>
+
+          <div class="form-actions">
+            <div class="form-footnote">
+              <span id="healthText">正在检查服务状态...</span>
+            </div>
+            <button type="submit" id="submitBtn">生成旅行计划</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section id="resultPage" class="page">
+      <div class="result-shell">
+        <header class="result-topbar">
+          <button type="button" class="ghost-button topbar-button" id="backToFormBtn">返回编辑</button>
+          <div class="result-title-block">
+            <div class="eyebrow">Travel Plan Report</div>
+            <h1>旅行计划报告</h1>
+          </div>
+          <div id="runState" class="badge">等待输入</div>
+        </header>
+
+        <div id="sourceBar" class="source-bar">
+          <div class="source-chip">规划来源：未生成</div>
+          <div class="source-chip">景点数据：未生成</div>
+          <div class="source-chip">天气数据：未生成</div>
+          <div class="source-chip">酒店数据：未生成</div>
+        </div>
+
+        <div id="progressPanel" class="progress-panel" hidden>
+          <div class="progress-head">
+            <div>
+              <div class="eyebrow">生成进度</div>
+              <div id="progressTitle" class="progress-title">准备规划...</div>
+            </div>
+            <div id="progressPercent" class="progress-percent">0%</div>
+          </div>
+          <div class="progress-track">
+            <div id="progressFill" class="progress-fill"></div>
+          </div>
+          <div id="progressDetail" class="progress-detail">正在整理你的旅行需求</div>
+        </div>
+
+        <div class="result-layout">
+          <aside id="resultNav" class="result-nav" hidden>
+            <div class="result-nav-title">目录</div>
+            <button type="button" class="nav-link" data-target="overview">行程概览</button>
+            <button type="button" class="nav-link" data-target="route-map">路线总览</button>
+            <button type="button" class="nav-link" data-target="hotel">住宿建议</button>
+            <button type="button" class="nav-link" data-target="attractions">景点筛选</button>
+            <button type="button" class="nav-link" data-target="budget">预算拆分</button>
+            <button type="button" class="nav-link" data-target="days">每日行程</button>
+            <button type="button" class="nav-link" data-target="risks">提醒清单</button>
+          </aside>
+
+          <div id="resultView" class="result-view empty">
+            <div class="placeholder-title">还没有旅行计划</div>
+            <p>提交表单后，这里会显示每日行程、预算拆分、酒店建议和交通路线说明。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
