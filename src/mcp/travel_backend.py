@@ -415,9 +415,22 @@ class TravelDataBackend:
         travelers = int(travelers if travelers is not None else kwargs.get("travelers", 2) or 2)
         stay_nights = int(stay_nights if stay_nights is not None else kwargs.get("stay_length", 1) or 1)
         hotel_style = kwargs.get("style", hotel_style)
+        limit = max(1, min(int(kwargs.get("limit", 3) or 3), 12))
+        area_hint = self._safe_text(kwargs.get("area_hint", ""))
+        search_focus = self._safe_text(kwargs.get("search_focus", "main"), "main")
 
         if self.amap_key:
-            live = self._search_hotels_live(city, budget_min, budget_max, travelers, stay_nights, hotel_style)
+            live = self._search_hotels_live(
+                city,
+                budget_min,
+                budget_max,
+                travelers,
+                stay_nights,
+                hotel_style,
+                limit=limit,
+                area_hint=area_hint,
+                search_focus=search_focus,
+            )
             if live:
                 return live
 
@@ -437,12 +450,14 @@ class TravelDataBackend:
             candidates.append((score, hotel))
 
         candidates.sort(key=lambda item: (-item[0], item[1]["nightly"]))
-        serialized = [self._serialize_hotel(item[1]) for item in candidates[:3]]
+        serialized = [self._serialize_hotel(item[1]) for item in candidates[:limit]]
         return {
             "city": city,
             "per_night_cap": round(per_night_cap, 2),
             "candidates": serialized,
             "data_mode": "fallback",
+            "area_hint": area_hint,
+            "search_focus": search_focus,
         }
 
     def search_restaurants(
@@ -841,12 +856,17 @@ class TravelDataBackend:
         travelers: int,
         stay_nights: int,
         hotel_style: str,
+        *,
+        limit: int = 3,
+        area_hint: str = "",
+        search_focus: str = "main",
     ) -> dict[str, Any] | None:
         geo = self.geocode_city(city)
         if not geo:
             return None
 
-        keyword = {"budget": "快捷酒店", "comfort": "酒店", "premium": "高档酒店"}.get(hotel_style, "酒店")
+        base_keyword = {"budget": "快捷酒店", "comfort": "酒店", "premium": "高档酒店"}.get(hotel_style, "酒店")
+        keyword = " ".join(part for part in [area_hint, base_keyword, "" if search_focus == "main" else search_focus] if part)
         try:
             payload = self._amap_get(
                 "https://restapi.amap.com/v3/place/text",
@@ -854,7 +874,7 @@ class TravelDataBackend:
                     "keywords": keyword,
                     "city": geo["adcode"] or city,
                     "citylimit": "true",
-                    "offset": 8,
+                    "offset": max(limit, 8),
                     "page": 1,
                 },
             )
@@ -891,7 +911,7 @@ class TravelDataBackend:
                     },
                 }
             )
-            if len(candidates) >= 3:
+            if len(candidates) >= limit:
                 break
 
         if not candidates:
@@ -902,6 +922,8 @@ class TravelDataBackend:
             "per_night_cap": round(per_night_cap, 2),
             "candidates": candidates,
             "data_mode": "live",
+            "area_hint": area_hint,
+            "search_focus": search_focus,
         }
 
     def _search_restaurants_live(
@@ -952,6 +974,11 @@ class TravelDataBackend:
                 if not name or name in seen or "," not in location:
                     continue
                 lng, lat = [float(item) for item in location.split(",")]
+                address = self._safe_text(poi.get("address"))
+                address_source = "poi"
+                if not address:
+                    address = self._reverse_geocode_address(lat, lng)
+                    address_source = "reverse_geocode" if address else "missing"
                 seen.add(name)
                 restaurants.append(
                     {
@@ -963,11 +990,12 @@ class TravelDataBackend:
                             len(restaurants),
                         ),
                         "price_source": "estimated_from_poi",
+                        "address_source": address_source,
                         "summary": self._safe_text(poi.get("type"), "高德 POI 餐饮候选"),
                         "nearby_anchor": self._safe_text(search_anchor, city),
                         "location": {
                             "name": name,
-                            "address": self._safe_text(poi.get("address")),
+                            "address": address,
                             "lat": lat,
                             "lng": lng,
                         },
@@ -1429,8 +1457,8 @@ class TravelDataBackend:
             if railway:
                 parsed.append(
                     self._segment(
-                        segment_type="subway",
-                        instruction=railway.get("trip", "") or "乘坐地铁",
+                        segment_type="railway",
+                        instruction=railway.get("trip", "") or "乘坐铁路/城际铁路",
                         duration_min=max(int(float(railway.get("time", 0) or 0) / 60), 0),
                         distance_m=int(float(railway.get("distance", 0) or 0)),
                         line_name=railway.get("name", ""),
@@ -1485,8 +1513,18 @@ class TravelDataBackend:
         return parsed
 
     def _is_subway_line(self, line_name: str, line_type: str) -> bool:
-        text = f"{line_name} {line_type}".lower()
-        return any(keyword in text for keyword in ["地铁", "轨道", "号线", "metro", "subway"])
+        normalized_type = str(line_type or "").lower()
+        normalized_name = str(line_name or "").lower()
+        subway_markers = ("地铁", "轨道", "轨道交通", "轻轨", "metro", "subway")
+        bus_markers = ("公交", "公共汽车", "旅游", "专线", "bus")
+
+        if any(marker in normalized_type for marker in subway_markers):
+            return True
+        if any(marker in normalized_type for marker in bus_markers):
+            return False
+        if any(marker in normalized_name for marker in subway_markers):
+            return True
+        return False
 
     def _build_transit_direction(self, line_name: str, departure_stop: str, arrival_stop: str) -> str:
         if "(" in line_name and ")" in line_name:
@@ -1667,6 +1705,24 @@ class TravelDataBackend:
             self._last_poi_geocode_error = "poi_request_exception"
             return None
 
+    def _reverse_geocode_address(self, lat: float, lng: float) -> str:
+        if not self.amap_key or lat == 0.0 and lng == 0.0:
+            return ""
+        try:
+            payload = self._amap_get(
+                "https://restapi.amap.com/v3/geocode/regeo",
+                {
+                    "location": f"{lng},{lat}",
+                    "extensions": "base",
+                },
+            )
+            if payload is None or str(payload.get("status")) != "1":
+                return ""
+            regeocode = payload.get("regeocode") or {}
+            return self._safe_text(regeocode.get("formatted_address"))
+        except Exception:
+            return ""
+
     def _estimate_attraction_ticket(self, keyword: str, daily_budget: float) -> float:
         if keyword in {"公园", "步行街", "夜市"}:
             return 0.0
@@ -1698,6 +1754,11 @@ class TravelDataBackend:
 
     def _restaurant_keywords(self, preferences: list[str]) -> list[str]:
         keywords: list[str] = []
+        known_tags = {"food", "nightlife", "humanity", "art"}
+        for preference in preferences:
+            cleaned = self._safe_text(preference)
+            if cleaned and cleaned not in known_tags:
+                keywords.append(cleaned)
         if "food" in preferences:
             keywords.extend(["美食", "本地菜", "特色餐厅"])
         if "nightlife" in preferences:

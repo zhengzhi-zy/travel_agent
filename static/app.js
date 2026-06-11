@@ -44,6 +44,8 @@ const els = {
 
 // 存储用户选中的偏好标签，使用Set结构方便快速增删和判断存在性
 const selectedPreferences = new Set(["humanity", "food"]);
+const MAX_TRIP_DAYS = 7;
+const LONG_TRIP_MESSAGE = "本工具适合 1-7 天轻量旅行建议，请把行程控制在 7 天以内。";
 // SSE(服务器推送事件)连接对象，用于接收后端实时进度
 let progressSource = null;
 // 当前进度百分比，只会递增，保证用户体验流畅
@@ -54,9 +56,9 @@ const progressStages = [
   { percent: 8, title: "校验旅行需求", detail: "正在检查城市、日期、预算和出行方式。" },
   { percent: 18, title: "景点 Agent 规划搜索", detail: "AttractionSearchAgent 正在理解偏好和忌讳，并调用高德 POI 工具。" },
   { percent: 30, title: "天气 Agent 研究", detail: "WeatherSearchAgent 正在整理天气风险和出行建议。" },
-  { percent: 42, title: "酒店 Agent 筛选", detail: "HotelSearchAgent 正在根据预算、人数和住宿偏好筛酒店候选。" },
-  { percent: 55, title: "餐饮候选检索", detail: "正在按当天景点、酒店和夜生活区域检索真实餐饮 POI。" },
-  { percent: 68, title: "行程 Agent 编排", detail: "ItineraryPlanningAgent 正在把景点、酒店、餐饮和天气合成每日行程。" },
+  { percent: 42, title: "酒店 Agent 筛选", detail: "HotelSearchAgent 正在按住宿节奏和区域生成酒店候选。" },
+  { percent: 55, title: "餐饮与预算交给最终 Agent", detail: "最终行程 Agent 将直接生成餐饮安排和价格估算。" },
+  { percent: 68, title: "行程 Agent 编排", detail: "ItineraryPlanningAgent 正在把景点、酒店、餐饮、价格和天气合成每日行程。" },
   { percent: 82, title: "高德路线规划", detail: "正在为每天的地点链计算公交、步行、打车或自驾路线。" },
   { percent: 93, title: "整理可视化报告", detail: "正在汇总预算、风险提醒、搜索计划和详细路径。" },
 ];
@@ -242,6 +244,29 @@ function buildPayload() {
   };
 }
 
+function getTripDayCount(startValue, endValue) {
+  if (!startValue || !endValue) {
+    return 0;
+  }
+  const start = new Date(`${startValue}T00:00:00`);
+  const end = new Date(`${endValue}T00:00:00`);
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) {
+    return 0;
+  }
+  return Math.floor((end - start) / 86400000) + 1;
+}
+
+function updateDateSpanValidity({ report = false } = {}) {
+  const dayCount = getTripDayCount(els.startDate.value, els.endDate.value);
+  const isTooLong = dayCount > MAX_TRIP_DAYS;
+  els.endDate.setCustomValidity(isTooLong ? LONG_TRIP_MESSAGE : "");
+  els.submitBtn.disabled = isTooLong;
+  if (report && isTooLong) {
+    els.endDate.reportValidity();
+  }
+  return isTooLong ? { detail: LONG_TRIP_MESSAGE, focus: els.endDate } : null;
+}
+
 // 前端验证表单数据的合法性
 function validatePayload(payload) {
   if (!payload.city) {
@@ -249,6 +274,10 @@ function validatePayload(payload) {
   }
   if (payload.start_date && payload.end_date && payload.end_date < payload.start_date) {
     return { detail: "结束日期必须大于等于开始日期", focus: els.endDate };
+  }
+  const longTripError = updateDateSpanValidity();
+  if (longTripError) {
+    return longTripError;
   }
   if (Number.isFinite(payload.budget_min) && Number.isFinite(payload.budget_max) && payload.budget_max < payload.budget_min) {
     return { detail: "最高预算必须大于等于最低预算", focus: els.budgetMax };
@@ -266,6 +295,25 @@ function escapeHtml(text) {
 
 function normalizeAddress(value) {
   return String(value || "").trim();
+}
+
+function timeSortKey(value) {
+  const text = String(value || "").trim();
+  const start = text.split("-", 1)[0].trim();
+  const hourText = start.split(":", 1)[0].trim();
+  const hour = Number.parseInt(hourText, 10);
+  if (Number.isFinite(hour) && hour >= 0 && hour <= 23) {
+    return [hour, text];
+  }
+  return [99, text];
+}
+
+function sortItemsByTime(items) {
+  return [...items].sort((left, right) => {
+    const [leftHour, leftText] = timeSortKey(left?.time_range);
+    const [rightHour, rightText] = timeSortKey(right?.time_range);
+    return leftHour - rightHour || leftText.localeCompare(rightText, "zh-Hans-CN");
+  });
 }
 
 function buildLocationAddressMap(plan) {
@@ -291,6 +339,17 @@ function buildLocationAddressMap(plan) {
     add(plan.recommended_hotel.name, plan.recommended_hotel.location?.address);
     add(plan.recommended_hotel.location?.name, plan.recommended_hotel.location?.address);
   }
+  (plan.hotel_candidates || []).forEach((item) => {
+    add(item.name, item.location?.address);
+    add(item.location?.name, item.location?.address);
+  });
+  (plan.daily_stays || []).forEach((stay) => {
+    [stay.start_hotel, stay.end_hotel].forEach((hotel) => {
+      if (!hotel) return;
+      add(hotel.name, hotel.location?.address);
+      add(hotel.location?.name, hotel.location?.address);
+    });
+  });
 
   // 3. 从每日行程中提取地址
   (plan.daily_plans || []).forEach((day) => {
@@ -375,6 +434,7 @@ function segmentTypeLabel(value) {
   return {
     walk: "步行",
     subway: "地铁",
+    railway: "铁路/城际",
     bus: "公交",
     transit: "公共交通",
     taxi: "打车",
@@ -790,7 +850,7 @@ function renderErrorCard(errorLike) {
 function collectRouteStops(plan) {
   const stops = [];
   (plan.daily_plans || []).forEach((day, dayIndex) => {
-    (day.items || []).forEach((item) => {
+    sortItemsByTime(day.items || []).forEach((item) => {
       if (item.item_type === "transport") return;
       const name = item.location_name || item.title;
       if (!name) return;
@@ -809,7 +869,12 @@ function renderRouteMap(plan) {
   const stops = collectRouteStops(plan);
   const dayCount = Array.isArray(plan.daily_plans) ? plan.daily_plans.length : 0;
   const transportCost = Number(plan.budget?.transport || 0);
-  const hotelName = plan.recommended_hotel?.name || "暂无酒店推荐";
+  const stayHotels = new Set((plan.daily_stays || [])
+    .map((stay) => stay.end_hotel?.name || stay.start_hotel?.name)
+    .filter(Boolean));
+  const hotelName = stayHotels.size
+    ? `${stayHotels.size} 个住宿基点`
+    : plan.recommended_hotel?.name || "暂无酒店推荐";
   const visibleStops = stops.slice(0, 12);
   const hiddenCount = Math.max(0, stops.length - visibleStops.length);
 
@@ -847,11 +912,137 @@ function renderRouteMap(plan) {
   `;
 }
 
+function renderHotelCard(hotel, title = "") {
+  if (!hotel) {
+    return "<div class='mini-text'>暂无酒店推荐</div>";
+  }
+  return `
+    <div class="hotel-card">
+      ${title ? `<div class="hotel-card-kicker">${escapeHtml(title)}</div>` : ""}
+      <div class="mini-title">${escapeHtml(hotel.name)}</div>
+      <div class="mini-text">${escapeHtml(hotel.summary)}</div>
+      <div class="mini-address">地址：${escapeHtml(normalizeAddress(hotel.location?.address) || "暂无详细地址")}</div>
+      <div class="mini-text">¥${Number(hotel.nightly_price).toFixed(0)} / 晚 · ${escapeHtml(hotel.nearby_area)}</div>
+      <div class="mini-text">价格来源：${escapeHtml(hotel.price_source || "estimated")}</div>
+      ${hotel.booking_url ? `<a class="hotel-link" href="${encodeURI(hotel.booking_url)}" target="_blank" rel="noreferrer">查看 OTA 候选</a>` : ""}
+    </div>
+  `;
+}
+
+function renderDailyHotelCard(stay, dayIndex, hotelItem = null) {
+  const startHotel = stay?.start_hotel || null;
+  const endHotel = stay?.end_hotel || startHotel;
+  if (!startHotel && !endHotel) {
+    if (!hotelItem) {
+      return "";
+    }
+    const itemName = hotelItem.location_name || hotelItem.title || "当日住宿安排";
+    return `
+      <section class="day-hotel-card">
+        <div class="day-hotel-main">
+          <div class="day-hotel-kicker">第 ${dayIndex + 1} 天住宿</div>
+          <div class="day-hotel-name">${escapeHtml(itemName)}</div>
+          <div class="day-hotel-meta">
+            ${hotelItem.time_range ? `<span>${escapeHtml(hotelItem.time_range)}</span>` : ""}
+            <span>住宿节点</span>
+          </div>
+        </div>
+        <div class="day-hotel-detail">
+          <div>${escapeHtml(hotelItem.summary || "当日酒店安排")}</div>
+          <div class="mini-address">地址：${escapeHtml(normalizeAddress(hotelItem.location_address) || "暂无详细地址")}</div>
+        </div>
+      </section>
+    `;
+  }
+  const hotel = endHotel || startHotel;
+  const isChanged = Boolean(stay?.hotel_changed && startHotel && endHotel && startHotel.name !== endHotel.name);
+  const price = stay?.charged_night && hotel
+    ? `¥${Number(hotel.nightly_price || 0).toFixed(0)} / 晚`
+    : "当日不新增住宿费用";
+  const routeText = isChanged
+    ? `${startHotel.name} → ${endHotel.name}`
+    : hotel.name;
+
+  return `
+    <section class="day-hotel-card">
+      <div class="day-hotel-main">
+        <div class="day-hotel-kicker">第 ${dayIndex + 1} 天住宿</div>
+        <div class="day-hotel-name">${escapeHtml(routeText)}</div>
+        <div class="day-hotel-meta">
+          <span>${escapeHtml(price)}</span>
+          ${hotelItem?.time_range ? `<span>${escapeHtml(hotelItem.time_range)}</span>` : ""}
+          <span>${escapeHtml(hotel.nearby_area || stay?.night_area || "夜间区域灵活")}</span>
+          ${isChanged ? "<span>换宿</span>" : "<span>住宿基点</span>"}
+        </div>
+      </div>
+      <div class="day-hotel-detail">
+        <div>${escapeHtml(hotel.summary || stay?.reason || "当日住宿安排")}</div>
+        <div class="mini-address">地址：${escapeHtml(normalizeAddress(hotel.location?.address) || "暂无详细地址")}</div>
+        ${hotelItem?.summary ? `<div class="mini-text">${escapeHtml(hotelItem.summary)}</div>` : ""}
+        ${stay?.reason ? `<div class="mini-text">${escapeHtml(stay.reason)}</div>` : ""}
+      </div>
+    </section>
+  `;
+}
+
+function getDailyStayForDay(plan, dayIndex) {
+  const stays = Array.isArray(plan.daily_stays) ? plan.daily_stays : [];
+  const expectedDay = dayIndex + 1;
+  return stays.find((stay) => Number(stay?.day_index) === expectedDay) || stays[dayIndex] || null;
+}
+
+function getDayHotelItem(day) {
+  const items = Array.isArray(day?.items) ? day.items : [];
+  return items.find((item) => item?.item_type === "hotel") || null;
+}
+
+function getVisibleDayItems(day) {
+  const items = Array.isArray(day?.items) ? day.items : [];
+  return items.filter((item) => item?.item_type !== "hotel");
+}
+
+function renderDailyStays(plan) {
+  const stays = Array.isArray(plan.daily_stays) ? plan.daily_stays : [];
+  if (!stays.length) {
+    return "";
+  }
+  return `
+    <div class="daily-stay-list">
+      ${stays.map((stay) => {
+        const startName = stay.start_hotel?.name || "灵活出发";
+        const endName = stay.end_hotel?.name || "灵活住宿";
+        const price = stay.charged_night && stay.end_hotel
+          ? `¥${Number(stay.end_hotel.nightly_price || 0).toFixed(0)}`
+          : "不计住宿";
+        return `
+          <div class="daily-stay-card">
+            <div class="daily-stay-head">
+              <strong>第 ${Number(stay.day_index || 0)} 天</strong>
+              <span>${escapeHtml(price)}</span>
+            </div>
+            <div class="daily-stay-route">
+              <span>${escapeHtml(startName)}</span>
+              <span>→</span>
+              <span>${escapeHtml(endName)}</span>
+            </div>
+            <div class="mini-text">夜间区域：${escapeHtml(stay.night_area || "灵活安排")}</div>
+            <div class="mini-text">${escapeHtml(stay.reason || "")}</div>
+            ${stay.hotel_changed ? `<div class="stay-badge">含换宿与行李寄存</div>` : ""}
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
 function renderMetrics(plan, payload) {
   const dayCount = Array.isArray(plan.daily_plans) ? plan.daily_plans.length : 0;
   const attractionCount = Array.isArray(plan.selected_attractions) ? plan.selected_attractions.length : 0;
   const budgetTotal = Number(plan.budget?.total || 0);
-  const hotelPrice = Number(plan.recommended_hotel?.nightly_price || 0);
+  const chargedStays = (plan.daily_stays || []).filter((stay) => stay.charged_night && stay.end_hotel);
+  const hotelPrice = chargedStays.length
+    ? chargedStays.reduce((sum, stay) => sum + Number(stay.end_hotel?.nightly_price || 0), 0) / chargedStays.length
+    : Number(plan.recommended_hotel?.nightly_price || 0);
   return `
     <div class="metric-grid">
       <div class="metric">
@@ -867,7 +1058,7 @@ function renderMetrics(plan, payload) {
         <div class="metric-value">${escapeHtml(transportModeLabel(payload.transport_mode))}</div>
       </div>
       <div class="metric">
-        <div class="metric-label">酒店均价</div>
+        <div class="metric-label">住宿均价</div>
         <div class="metric-value">¥${hotelPrice.toFixed(0)}</div>
       </div>
       <div class="metric">
@@ -913,24 +1104,29 @@ function renderPlan(plan) {
   if (els.resultNav) {
     els.resultNav.hidden = false;
   }
-  const daysHtml = plan.daily_plans.map((day, index) => `
-    <article class="day-card" id="day-${index + 1}">
-      <div class="day-head">
-        <h3>第 ${index + 1} 天 · ${escapeHtml(day.date)}</h3>
-        <div class="mini-badge weather-pill">
-          <span class="weather-dot"></span>
-          ${escapeHtml(day.weather.condition)} ${day.weather.low_c}-${day.weather.high_c}C
+  const daysHtml = plan.daily_plans.map((day, index) => {
+    const hotelItem = getDayHotelItem(day);
+    const visibleItems = getVisibleDayItems(day);
+    return `
+      <article class="day-card" id="day-${index + 1}">
+        <div class="day-head">
+          <h3>第 ${index + 1} 天 · ${escapeHtml(day.date)}</h3>
+          <div class="mini-badge weather-pill">
+            <span class="weather-dot"></span>
+            ${escapeHtml(day.weather.condition)} ${day.weather.low_c}-${day.weather.high_c}C
+          </div>
         </div>
-      </div>
-      <div class="day-summary">
-        <p class="route-summary">${escapeHtml(day.route_summary)}</p>
-        <div class="day-meta-line">当日交通合计：¥${Number(day.total_transport_cost).toFixed(0)} / ${Number(day.total_transport_time_min).toFixed(0)} 分钟</div>
-      </div>
-      <div class="item-list">
-        ${day.items.map((item) => renderPlanItem(item, locationAddressMap)).join("")}
-      </div>
-    </article>
-  `).join("");
+        <div class="day-summary">
+          <p class="route-summary">${escapeHtml(day.route_summary)}</p>
+          <div class="day-meta-line">当日交通合计：¥${Number(day.total_transport_cost).toFixed(0)} / ${Number(day.total_transport_time_min).toFixed(0)} 分钟</div>
+        </div>
+        ${renderDailyHotelCard(getDailyStayForDay(plan, index), index, hotelItem)}
+        <div class="item-list">
+          ${visibleItems.map((item) => renderPlanItem(item, locationAddressMap)).join("")}
+        </div>
+      </article>
+    `;
+  }).join("");
 
   const attractionsHtml = plan.selected_attractions.map((item) => `
     <div class="mini-card">
@@ -940,16 +1136,10 @@ function renderPlan(plan) {
     </div>
   `).join("");
 
-  const hotelHtml = plan.recommended_hotel ? `
-    <div class="hotel-card">
-      <div class="mini-title">${escapeHtml(plan.recommended_hotel.name)}</div>
-      <div class="mini-text">${escapeHtml(plan.recommended_hotel.summary)}</div>
-      <div class="mini-address">地址：${escapeHtml(normalizeAddress(plan.recommended_hotel.location?.address) || "暂无详细地址")}</div>
-      <div class="mini-text">¥${Number(plan.recommended_hotel.nightly_price).toFixed(0)} / 晚 · ${escapeHtml(plan.recommended_hotel.nearby_area)}</div>
-      <div class="mini-text">价格来源：${escapeHtml(plan.recommended_hotel.price_source || "estimated")}</div>
-      ${plan.recommended_hotel.booking_url ? `<a class="hotel-link" href="${encodeURI(plan.recommended_hotel.booking_url)}" target="_blank" rel="noreferrer">查看 OTA 候选</a>` : ""}
-    </div>
-  ` : "<div class='mini-text'>暂无酒店推荐</div>";
+  const hotelHtml = `
+    ${renderHotelCard(plan.recommended_hotel, "首推住宿")}
+    ${renderDailyStays(plan)}
+  `;
 
   const transitPreferenceText = payload.transport_mode === "public_transit"
     ? `，偏好：${transitPreferenceLabel(payload.transit_preference)}`
@@ -977,7 +1167,7 @@ function renderPlan(plan) {
       <div class="column" id="hotel">
         <div class="section-title-row">
           <h2>住宿建议</h2>
-          <span class="section-tag">按预算与路线基点选择</span>
+          <span class="section-tag">按每日路线基点选择</span>
         </div>
         ${hotelHtml}
       </div>
@@ -1042,22 +1232,22 @@ function renderPlan(plan) {
 
 async function submitPlan(event) {
   event.preventDefault();
+  const payload = buildPayload();
+  const validationError = validatePayload(payload);
+  if (validationError) {
+    renderErrorCard(validationError);
+    validationError.focus?.focus();
+    validationError.focus?.reportValidity?.();
+    setState("待调整");
+    return;
+  }
+
   showPage("result");
   setState("规划中");
   startProgress();
   els.submitBtn.disabled = true;
 
   try {
-    const payload = buildPayload();
-    const validationError = validatePayload(payload);
-    if (validationError) {
-      failProgress();
-      renderErrorCard(validationError);
-      validationError.focus?.focus();
-      setState("待调整");
-      return;
-    }
-
     const task = await createPlanTask(payload);
     const data = await waitForPlanStream(task.task_id);
     if (!data) {
@@ -1071,12 +1261,17 @@ async function submitPlan(event) {
     setState("失败");
   } finally {
     els.submitBtn.disabled = false;
+    updateDateSpanValidity();
   }
 }
 
 
 function bindGlobalEvents() {
   els.transportMode.addEventListener("change", updateTransitPreferenceVisibility);
+  [els.startDate, els.endDate].forEach((input) => {
+    input.addEventListener("input", () => updateDateSpanValidity({ report: true }));
+    input.addEventListener("change", () => updateDateSpanValidity({ report: true }));
+  });
   els.form.addEventListener("submit", submitPlan);
   els.backToFormBtn.addEventListener("click", () => {
     stopProgress();

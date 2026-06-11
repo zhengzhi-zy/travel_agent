@@ -15,6 +15,8 @@ HotelStyle = Literal["budget", "comfort", "premium"]
 TransportMode = Literal["public_transit", "self_drive", "taxi", "mixed", "walk"]
 # 公交偏好，对应前端transitPreference下拉框
 TransitPreference = Literal["recommended", "less_walking", "subway_priority", "bus_priority"]
+# 餐饮类型：只区分早/中/晚餐，不引入 snack。
+MealType = Literal["breakfast", "lunch", "dinner"]
 
 
 class TravelRequest(BaseModel):
@@ -157,11 +159,12 @@ class RestaurantOption(BaseModel):
     cuisine: str = ""
     avg_cost_per_person: float = 0.0
     price_source: str = "estimated"
+    address_source: str = "poi"
     summary: str = ""
     nearby_anchor: str = ""
     location: Location
 
-    @field_validator("name", "cuisine", "price_source", "summary", "nearby_anchor", mode="before")
+    @field_validator("name", "cuisine", "price_source", "address_source", "summary", "nearby_anchor", mode="before")
     @classmethod
     def normalize_text(cls, value: Any) -> str:
         if value is None:
@@ -174,22 +177,38 @@ class RestaurantOption(BaseModel):
         return str(value).strip()
 
 
-class DayMealResearch(BaseModel):
+class MealIntent(BaseModel):
+    meal_type: MealType
+    time_range: str
+    anchor_name: str
+    anchor_type: str = ""
+    cuisine_intent: str
+    budget_total: float = 0.0
+    must_avoid: list[str] = Field(default_factory=list)
+    reason: str = ""
+
+    @field_validator("time_range", "anchor_name", "anchor_type", "cuisine_intent", "reason", mode="before")
+    @classmethod
+    def normalize_text(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (list, tuple, set)):
+            parts = [str(item).strip() for item in value if str(item).strip()]
+            return " ".join(parts)
+        return str(value).strip()
+
+
+class DailyStayPlan(BaseModel):
     day_index: int
     date: date
-    # 当天围绕哪些地点查餐饮
-    anchors: list[str] = Field(default_factory=list)
-    # 餐饮候选
-    candidates: list[RestaurantOption] = Field(default_factory=list)
-    dining_strategy: str = ""
-
-
-class MealResearch(BaseModel):
-    city: str
-    city_summary: str = ""
-    day_candidates: list[DayMealResearch] = Field(default_factory=list)
-    general_candidates: list[RestaurantOption] = Field(default_factory=list)
-    planning_notes: list[str] = Field(default_factory=list)
+    start_hotel: HotelOption | None = None
+    end_hotel: HotelOption | None = None
+    night_area: str = ""
+    charged_night: bool = True
+    hotel_changed: bool = False
+    reason: str = ""
 
 
 class BudgetBreakdown(BaseModel):
@@ -221,11 +240,13 @@ class DayPlanItem(BaseModel):
     time_range: str
     title: str
     item_type: str
+    meal_type: MealType | str = ""
     location_name: str
     location_address: str = ""
     summary: str
     estimated_cost: float = 0.0
     reason: str = ""
+    is_route_stop: bool = True
     transport_mode: str = ""
     from_location: str = ""
     to_location: str = ""
@@ -266,6 +287,7 @@ class DayPlan(BaseModel):
     date: date
     weather: WeatherInfo
     route_summary: str
+    meal_intents: list[MealIntent] = Field(default_factory=list)
     items: list[DayPlanItem] = Field(default_factory=list)
     total_transport_cost: float = 0.0
     total_transport_time_min: int = 0
@@ -307,6 +329,8 @@ class TripPlan(BaseModel):
     agent_diagnostics: dict[str, Any] = Field(default_factory=dict)
     selected_attractions: list[Attraction] = Field(default_factory=list)
     recommended_hotel: HotelOption | None = None
+    hotel_candidates: list[HotelOption] = Field(default_factory=list)
+    daily_stays: list[DailyStayPlan] = Field(default_factory=list)
     daily_plans: list[DayPlan] = Field(default_factory=list)
     budget: BudgetBreakdown
     packing_tips: list[str] = Field(default_factory=list)

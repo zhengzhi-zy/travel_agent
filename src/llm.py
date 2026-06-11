@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from src.config import LLMSettings
@@ -128,7 +129,14 @@ class HelloAgentRuntime:
                 "failure_reason": "" if data is not None else "llm_output_json_parse_failed",
             }
         )
+        self._print_agent_output(name, text, data is not None)
         return data, trace
+
+    def _print_agent_output(self, name: str, text: str, json_parse_ok: bool) -> None:
+        status = "JSON_OK" if json_parse_ok else "JSON_PARSE_FAILED"
+        print(f"\n========== {name} OUTPUT [{status}] ==========")
+        print(text or "<empty>")
+        print(f"========== END {name} OUTPUT ==========\n")
 
     def _run_strict_json_tool_loop(
         self,
@@ -147,7 +155,7 @@ class HelloAgentRuntime:
             enable_tool_calling=True,
         )
         messages = [
-            {"role": "system", "content": agent._get_enhanced_system_prompt()},
+            {"role": "system", "content": self._tool_loop_system_prompt(agent, system_prompt, tool_registry)},
             {"role": "user", "content": user_prompt},
         ]
         trace: dict[str, Any] = {
@@ -164,20 +172,30 @@ class HelloAgentRuntime:
         final_response = ""
 
         while current_iteration < max_tool_iterations:
-            response = str(self._llm.invoke(messages, temperature=self.settings.temperature))
-            tool_calls = agent._parse_tool_calls(response)
+            response = self._invoke_tool_loop(messages, tool_registry)
+            response_text = self._response_text(response)
+            tool_calls = self._extract_function_tool_calls(response)
 
             if tool_calls:
                 tool_results = []
-                clean_response = response
+                assistant_message = self._assistant_message_from_response(response, response_text, tool_calls)
                 for call in tool_calls:
-                    result = agent._execute_tool_call(call["tool_name"], call["parameters"])
+                    result = self._execute_registry_tool(agent, call["tool_name"], call["parameters"])
                     tool_results.append(result)
-                    clean_response = clean_response.replace(call["original"], "")
+                    call["result"] = result
                     trace["tool_calls_executed"] += 1
                     trace["tool_call_names"].append(call["tool_name"])
 
-                messages.append({"role": "assistant", "content": clean_response})
+                messages.append(assistant_message)
+                for call in tool_calls:
+                    if call.get("id"):
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call["id"],
+                                "content": call["result"],
+                            }
+                        )
                 messages.append(
                     {
                         "role": "user",
@@ -190,19 +208,19 @@ class HelloAgentRuntime:
                 trace["tool_iterations_used"] = current_iteration
                 continue
 
-            if extract_json_object(response) is not None:
-                final_response = response
+            if extract_json_object(response_text) is not None:
+                final_response = response_text
                 trace["strict_json_stop_reason"] = "valid_json"
                 break
 
-            trace["non_json_no_tool_outputs"].append(self._preview_text(response))
+            trace["non_json_no_tool_outputs"].append(self._preview_text(response_text))
             if trace["json_correction_attempts"] < 1:
-                messages.append({"role": "assistant", "content": response})
+                messages.append({"role": "assistant", "content": response_text})
                 messages.append({"role": "user", "content": self.JSON_CORRECTION_PROMPT})
                 trace["json_correction_attempts"] += 1
                 continue
 
-            final_response = response
+            final_response = response_text
             trace["strict_json_stop_reason"] = "non_json_after_correction"
             break
 
@@ -227,6 +245,155 @@ class HelloAgentRuntime:
                 trace["strict_json_stop_reason"] = "max_tool_iterations_json_correction"
 
         return final_response, trace
+
+    def _tool_loop_system_prompt(self, agent: Any, system_prompt: str, tool_registry: Any) -> str:
+        if hasattr(agent, "_get_enhanced_system_prompt"):
+            return str(agent._get_enhanced_system_prompt())
+        tools_description = ""
+        try:
+            tools_description = tool_registry.get_tools_description()
+        except Exception:
+            pass
+        if tools_description:
+            return f"{system_prompt}\n\nAvailable tools:\n{tools_description}"
+        return system_prompt
+
+    def _invoke_tool_loop(self, messages: list[dict[str, Any]], tool_registry: Any) -> Any:
+        tool_schemas = self._build_tool_schemas(tool_registry)
+        if tool_schemas and hasattr(self._llm, "invoke_with_tools"):
+            try:
+                return self._llm.invoke_with_tools(
+                    messages=messages,
+                    tools=tool_schemas,
+                    tool_choice="auto",
+                    temperature=self.settings.temperature,
+                )
+            except Exception:
+                pass
+        return self._llm.invoke(messages, temperature=self.settings.temperature)
+
+    def _build_tool_schemas(self, tool_registry: Any) -> list[dict[str, Any]]:
+        tools = []
+        try:
+            tools = list(tool_registry.get_all_tools())
+        except Exception:
+            return []
+        schemas: list[dict[str, Any]] = []
+        for tool in tools:
+            properties: dict[str, Any] = {}
+            required: list[str] = []
+            try:
+                parameters = tool.get_parameters()
+            except Exception:
+                parameters = []
+            for param in parameters:
+                properties[param.name] = {
+                    "type": self._json_schema_type(getattr(param, "type", "string")),
+                    "description": getattr(param, "description", "") or "",
+                }
+                default = getattr(param, "default", None)
+                if default is not None:
+                    properties[param.name]["default"] = default
+                if getattr(param, "required", True):
+                    required.append(param.name)
+            schema: dict[str, Any] = {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description or "",
+                    "parameters": {
+                        "type": "object",
+                        "properties": properties,
+                    },
+                },
+            }
+            if required:
+                schema["function"]["parameters"]["required"] = required
+            schemas.append(schema)
+        return schemas
+
+    def _json_schema_type(self, param_type: str) -> str:
+        normalized = (param_type or "").lower()
+        if normalized in {"string", "number", "integer", "boolean", "array", "object"}:
+            return normalized
+        return "string"
+
+    def _response_text(self, response: Any) -> str:
+        if hasattr(response, "choices"):
+            try:
+                message = response.choices[0].message
+                return str(message.content or "")
+            except Exception:
+                return str(response)
+        if hasattr(response, "content"):
+            return str(response.content or "")
+        return str(response)
+
+    def _extract_function_tool_calls(self, response: Any) -> list[dict[str, Any]]:
+        if not hasattr(response, "choices"):
+            return []
+        try:
+            raw_calls = response.choices[0].message.tool_calls or []
+        except Exception:
+            return []
+        calls: list[dict[str, Any]] = []
+        for raw_call in raw_calls:
+            try:
+                arguments = json.loads(raw_call.function.arguments or "{}")
+            except Exception:
+                arguments = {}
+            calls.append(
+                {
+                    "id": getattr(raw_call, "id", ""),
+                    "tool_name": raw_call.function.name,
+                    "parameters": arguments,
+                    "raw": raw_call,
+                }
+            )
+        return calls
+
+    def _assistant_message_from_response(
+        self,
+        response: Any,
+        response_text: str,
+        tool_calls: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if hasattr(response, "choices"):
+            try:
+                message = response.choices[0].message
+                return {
+                    "role": "assistant",
+                    "content": message.content,
+                    "tool_calls": [
+                        {
+                            "id": call["id"],
+                            "type": "function",
+                            "function": {
+                                "name": call["tool_name"],
+                                "arguments": json.dumps(call["parameters"], ensure_ascii=False),
+                            },
+                        }
+                        for call in tool_calls
+                    ],
+                }
+            except Exception:
+                pass
+        return {"role": "assistant", "content": response_text}
+
+    def _execute_registry_tool(self, agent: Any, tool_name: str, parameters: dict[str, Any]) -> str:
+        resolved_name = self._resolve_tool_name(agent.tool_registry, tool_name)
+        return agent._execute_tool_call(resolved_name, parameters)
+
+    def _resolve_tool_name(self, tool_registry: Any, tool_name: str) -> str:
+        try:
+            if tool_registry.get_tool(tool_name) is not None:
+                return tool_name
+            prefixed = f"travel_{tool_name}"
+            if tool_registry.get_tool(prefixed) is not None:
+                return prefixed
+        except Exception:
+            pass
+        return tool_name
 
     def _run_json_without_tools(
         self,

@@ -801,6 +801,62 @@ button:disabled {
   gap: 10px;
 }
 
+.hotel-card-kicker {
+  margin-bottom: 8px;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.daily-stay-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.daily-stay-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 12px;
+}
+
+.daily-stay-head,
+.daily-stay-route {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.daily-stay-head strong {
+  color: var(--ink);
+}
+
+.daily-stay-head span,
+.daily-stay-route {
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.daily-stay-route {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.stay-badge {
+  display: inline-flex;
+  margin-top: 8px;
+  border-radius: 999px;
+  background: #ecfeff;
+  color: var(--primary-deep);
+  padding: 5px 8px;
+  font-size: 12px;
+  font-weight: 900;
+}
+
 .budget-list > div {
   display: flex;
   align-items: center;
@@ -869,6 +925,64 @@ button:disabled {
   gap: 8px;
   padding: 14px 16px;
   border-bottom: 1px solid var(--line);
+}
+
+.day-hotel-card {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.72fr) minmax(0, 1fr);
+  gap: 14px;
+  margin: 14px 16px;
+  padding: 15px;
+  border: 1px solid rgba(15, 159, 143, 0.3);
+  border-radius: 8px;
+  background:
+    linear-gradient(135deg, #f0fdfa 0%, #ffffff 68%);
+}
+
+.day-hotel-main {
+  display: grid;
+  align-content: center;
+  gap: 7px;
+}
+
+.day-hotel-kicker {
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.day-hotel-name {
+  color: var(--ink);
+  font-size: 18px;
+  font-weight: 900;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.day-hotel-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.day-hotel-meta span {
+  display: inline-flex;
+  min-height: 26px;
+  align-items: center;
+  border-radius: 999px;
+  padding: 5px 9px;
+  background: #ffffff;
+  color: var(--primary-deep);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.day-hotel-detail {
+  display: grid;
+  align-content: center;
+  gap: 5px;
+  color: var(--muted);
+  line-height: 1.65;
 }
 
 .item-list {
@@ -1152,6 +1266,11 @@ button:disabled {
 
   .item {
     grid-template-columns: 1fr;
+  }
+
+  .day-hotel-card {
+    grid-template-columns: 1fr;
+    margin: 12px;
   }
 
   .route-alt-card summary {

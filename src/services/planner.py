@@ -2,27 +2,30 @@ from __future__ import annotations
 
 from datetime import timedelta
 from dataclasses import dataclass
+import math
+import time
 from typing import Any, Callable, Iterable
 
-from hello_agents.tools import MCPTool
+from hello_agents.tools.response import ToolResponse
 from hello_agents.tools.registry import ToolRegistry
+from pydantic import BaseModel, ValidationError
 
 from src.agents import AttractionSearchAgent, HotelSearchAgent, ItineraryPlanningAgent, WeatherSearchAgent
 from src.config import get_settings
 from src.llm import HelloAgentRuntime
 from src.mcp.travel_backend import PREFERENCE_LABELS, TravelDataBackend
-from src.mcp.travel_server import build_travel_mcp_server
+from src.mcp.travel_tool import TravelBackendTool
 from src.models import (
     Attraction,
     AttractionResearch,
     BudgetBreakdown,
+    DailyStayPlan,
     DayPlan,
     DayPlanItem,
-    DayMealResearch,
     HealthResponse,
     HotelOption,
     HotelResearch,
-    MealResearch,
+    MealIntent,
     RestaurantOption,
     RouteDetailSegment,
     RoutePlan,
@@ -42,6 +45,18 @@ class RouteTarget:
     lng: float = 0.0
 
 
+@dataclass
+class AgentValidationResult:
+    ok: bool
+    value: Any | None = None
+    errors: list[str] | None = None
+    current_count: int = 0
+
+    @property
+    def error_list(self) -> list[str]:
+        return self.errors or []
+
+
 class QuotaToolWrapper:
     '''包装一个工具，限制它一轮最多调用多少次'''
     def __init__(
@@ -52,21 +67,35 @@ class QuotaToolWrapper:
         duplicate_key_params: tuple[str, ...],  # 用哪些参数判断是否重复
     ) -> None:
         self._tool = tool
+        self._base_description = tool.description
         self.name = tool.name
-        self.description = (
-            f"{tool.description} 调用限制：本轮最多 {max_calls} 次；重复查询会返回缓存/拒绝提示。"
-        )
         self._max_calls = max_calls
+        self._base_max_calls = max_calls
         self._duplicate_key_params = duplicate_key_params
         self._calls = 0  # 记录本轮已经调用了多少次
         self._seen_keys: set[tuple[str, ...]] = set()  # 已经查过的key
         self._candidate_pool: list[dict[str, Any]] = []  # 候选池
+        self._refresh_description()
+
+    def _refresh_description(self) -> None:
+        self.description = (
+            f"{self._base_description} 调用限制：本轮最多 {self._max_calls} 次；重复查询会返回缓存/拒绝提示。"
+        )
 
     def reset_quota(self) -> None:
         '''重置函数：每次新生成一份旅游计划前，把上一轮状态情掉'''
+        self._max_calls = self._base_max_calls
+        self._refresh_description()
         self._calls = 0
         self._seen_keys.clear()
         self._candidate_pool.clear()
+
+    def extend_quota(self, extra_calls: int) -> None:
+        '''在不清空候选池的前提下，给返工补搜追加少量调用额度。'''
+        if extra_calls <= 0:
+            return
+        self._max_calls += extra_calls
+        self._refresh_description()
 
     def candidate_pool(self) -> list[dict[str, Any]]:
         '''把当前候选池拿出去'''
@@ -74,31 +103,56 @@ class QuotaToolWrapper:
         return self._candidate_pool[:]
 
     # agent调用工具，最终会进入这里的方法
-    def run(self, parameters: dict[str, Any]) -> str:
+    def run(self, parameters: dict[str, Any]) -> ToolResponse:
         normalized = self._normalize_parameters(parameters)  # 标准化参数
         # 根据指定参数生成查重key
         key = tuple(str(normalized.get(name, "")).strip().lower() for name in self._duplicate_key_params)
         # 判断这次查询是否重复
         if key and key in self._seen_keys:
-            return (
-                '{"quota_error": true, "reason": "duplicate_query", '
-                '"message": "这个高德景点查询已经调用过，请使用已有候选或换一个不同主题的关键词。"}'
+            return ToolResponse.success(
+                text=(
+                    '{"quota_error": true, "reason": "duplicate_query", '
+                    '"message": "这个高德景点查询已经调用过，请使用已有候选或换一个不同主题的关键词。"}'
+                )
             )
         # 判断调用次数是否超过限制
         if self._calls >= self._max_calls:
-            return (
-                '{"quota_error": true, "reason": "tool_call_limit_exceeded", '
-                '"message": "本轮景点 POI 查询次数已达上限，请从已有候选中筛选，不要继续调用。"}'
+            return ToolResponse.success(
+                text=(
+                    '{"quota_error": true, "reason": "tool_call_limit_exceeded", '
+                    '"message": "本轮景点 POI 查询次数已达上限，请从已有候选中筛选，不要继续调用。"}'
+                )
             )
         self._calls += 1
         # 把这次记录保存
         if key:
             self._seen_keys.add(key)
         # 进入 原始工具
-        result = self._tool.run(parameters)
+        result = self._tool.run(normalized)
+        response = result if isinstance(result, ToolResponse) else ToolResponse.success(text=str(result))
         # 工具返回结果后，把里面的candidates记录到候选池里，方便后续的验真
-        self._record_candidates(result)
-        return result
+        self._record_candidates(response.text)
+        return response
+
+    def run_with_timing(self, parameters: dict[str, Any]) -> ToolResponse:
+        start_time = time.time()
+        try:
+            response = self.run(parameters)
+        except Exception as exc:
+            response = ToolResponse.error(
+                code="INTERNAL_ERROR",
+                message=f"工具执行失败: {exc}",
+            )
+
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        if response.stats is None:
+            response.stats = {}
+        response.stats["time_ms"] = elapsed_ms
+        if response.context is None:
+            response.context = {}
+        response.context["params_input"] = parameters
+        response.context["tool_name"] = self.name
+        return response
 
     def get_parameters(self) -> Any:
         return self._tool.get_parameters()
@@ -157,13 +211,15 @@ class TravelPlannerService:
         )
         self.tool_registry = ToolRegistry()
         self.attraction_tool_registry = ToolRegistry()
+        self.hotel_tool_registry = ToolRegistry()
         self._attraction_quota_tools: list[QuotaToolWrapper] = []
-        self.mcp_tool = MCPTool(name="travel", server=build_travel_mcp_server(self.backend), auto_expand=True)
+        self._hotel_candidate_tools: list[QuotaToolWrapper] = []
+        self.mcp_tool = TravelBackendTool(self.backend)
         self._register_expanded_tools()
 
         self.attraction_agent = AttractionSearchAgent(self.runtime, self.attraction_tool_registry)
         self.weather_agent = WeatherSearchAgent(self.runtime, self.tool_registry)
-        self.hotel_agent = HotelSearchAgent(self.runtime, self.tool_registry)
+        self.hotel_agent = HotelSearchAgent(self.runtime, self.hotel_tool_registry)
         self.itinerary_agent = ItineraryPlanningAgent(self.runtime, self.tool_registry)
         self._request_transit_preference = "recommended"
 
@@ -200,7 +256,8 @@ class TravelPlannerService:
             )
 
         self._request_transit_preference = request.transit_preference
-        attraction_agent_diagnostics: dict[str, Any] = {}
+        constraint_context = self._build_constraint_context(request)
+        hotel_rotation_policy = self._hotel_rotation_policy(request)
 
         self._emit_progress(
             progress_callback,
@@ -209,39 +266,24 @@ class TravelPlannerService:
             title="准备景点候选",
             detail="正在读取城市画像和可用景点基础数据。",
         )
-        attraction_research = self._attraction_profile_research(request)
+        attraction_profile = self._attraction_profile_research(request)
+        attraction_source = self._source_from_attraction_research(attraction_profile)
+        if not self.runtime.available:
+            raise ValueError("景点 Agent 不可用：当前 LLM 未启用或 API Key 不可用，因此不能由 AttractionSearchAgent 自主生成景点候选。")
+
+        self._emit_progress(
+            progress_callback,
+            stage="attraction_agent",
+            percent=24,
+            title="景点 Agent 筛选",
+            detail="AttractionSearchAgent 正在理解全链路偏好/忌讳，并调用高德 POI 工具扩展候选。",
+        )
+        attraction_research = self._build_attraction_research_with_repair(
+            request,
+            attraction_profile,
+            constraint_context,
+        )
         attraction_source = self._source_from_attraction_research(attraction_research)
-        if self.runtime.available:
-            self._emit_progress(
-                progress_callback,
-                stage="attraction_agent",
-                percent=24,
-                title="景点 Agent 筛选",
-                detail="AttractionSearchAgent 正在理解偏好和忌讳，并调用高德 POI 工具。",
-            )
-            self._reset_attraction_tool_quotas()
-            agent_attractions = self.attraction_agent.research(request)
-            candidate_pool = self._attraction_candidate_pool()
-            attraction_agent_diagnostics = dict(agent_attractions.agent_diagnostics or {})
-            attraction_agent_diagnostics["candidate_pool_size"] = len(candidate_pool)
-            grounded_attractions = self._ground_agent_attraction_research(
-                agent_attractions,
-                attraction_research,
-                candidate_pool,
-            )
-            if grounded_attractions is not None:
-                attraction_research = grounded_attractions
-                attraction_agent_diagnostics = dict(attraction_research.agent_diagnostics or attraction_agent_diagnostics)
-                attraction_source = self._source_from_attraction_research(attraction_research)
-            else:
-                attraction_agent_diagnostics.setdefault("failure_reason", "agent_grounding_failed")
-                attraction_agent_diagnostics.setdefault(
-                    "grounding_summary",
-                    "景点 Agent 没有留下可用的、可在 MCP 候选池中验真的景点。",
-                )
-        if not attraction_research.selected_attractions:
-            attraction_research = self._fallback_attraction_research(request, attraction_agent_diagnostics)
-            attraction_source = self._source_from_attraction_research(attraction_research)
 
         self._emit_progress(
             progress_callback,
@@ -250,49 +292,34 @@ class TravelPlannerService:
             title="天气 Agent 研究",
             detail="正在整理天气、温度和出行风险提醒。",
         )
-        weather_research = self._fallback_weather_research(request)
+        weather_research = self._build_weather_research_with_repair(request, constraint_context)
         weather_source = self._source_from_weather_research(weather_research)
-        if self.runtime.available:
-            agent_weather = self.weather_agent.research(request)
-            if agent_weather.forecast:
-                weather_research = agent_weather
-                weather_source = self._source_from_weather_research(weather_research)
 
         self._emit_progress(
             progress_callback,
             stage="hotel",
             percent=48,
             title="酒店 Agent 筛选",
-            detail="正在按预算、人数、住宿风格和路线位置筛选酒店候选。",
+            detail="HotelSearchAgent 正在自主调用酒店工具生成候选池。",
         )
-        fallback_hotel_research = self._fallback_hotel_research(request)
-        hotel_research = fallback_hotel_research
+        if not self.runtime.available:
+            raise ValueError("酒店 Agent 不可用：当前 LLM 未启用或 API Key 不可用，因此不能由 HotelSearchAgent 自主生成酒店候选。")
+
+        hotel_research = self._build_hotel_research_with_repair(
+            request,
+            constraint_context,
+            hotel_rotation_policy,
+        )
         hotel_source = self._source_from_hotel_research(hotel_research)
-        if self.runtime.available:
-            agent_hotels = self.hotel_agent.research(request)
-            grounded_hotels = self._ground_hotel_research(agent_hotels, fallback_hotel_research)
-            if grounded_hotels is not None:
-                hotel_research = grounded_hotels
-                hotel_source = self._source_from_hotel_research(hotel_research)
 
         self._emit_progress(
             progress_callback,
             stage="meal",
             percent=58,
-            title="餐饮候选检索",
-            detail="正在按每日景点、酒店和夜生活区域检索真实餐饮候选。",
+            title="餐饮与预算交给最终 Agent",
+            detail="不再由程序检索餐厅或计算餐饮价格，最终行程 Agent 将直接生成餐饮安排和预算。",
         )
-        restaurant_catalog = self._build_restaurant_catalog(
-            request=request,
-            attractions=attraction_research,
-            hotels=hotel_research,
-        )
-        meal_research = self._build_meal_research(
-            request=request,
-            attractions=attraction_research,
-            hotels=hotel_research,
-            restaurant_catalog=restaurant_catalog,
-        )
+        restaurant_catalog: dict[str, list[RestaurantOption]] = {}
 
         self._emit_progress(
             progress_callback,
@@ -301,70 +328,40 @@ class TravelPlannerService:
             title="行程 Agent 编排",
             detail="正在把景点、酒店、餐饮和天气组合成每日行程。",
         )
-        llm_plan = self.itinerary_agent.plan(
+        llm_plan = self._build_trip_plan_with_repair(
             request,
             attraction_research,
             weather_research,
             hotel_research,
-            meal_research,
+            constraint_context,
+            hotel_rotation_policy,
+            restaurant_catalog,
         )
-        if llm_plan is not None:
-            llm_plan = self._ground_trip_plan(
-                llm_plan,
-                attraction_research,
-                hotel_research,
-                restaurant_catalog,
-            )
-        if llm_plan is not None:
-            llm_plan.planning_source = "llm_generated"
-            llm_plan.attraction_data_source = attraction_source
-            llm_plan.weather_data_source = weather_source
-            llm_plan.hotel_data_source = hotel_source
-            llm_plan.attraction_search_plan = attraction_research.search_plan
-            llm_plan.preference_interpretation = attraction_research.preference_interpretation
-            llm_plan.agent_diagnostics = attraction_research.agent_diagnostics
-            self._emit_progress(
-                progress_callback,
-                stage="route",
-                percent=84,
-                title="高德路线规划",
-                detail="正在为每日地点链计算详细交通路线和备选方案。",
-            )
-            self._inject_transport_details(
-                llm_plan,
-                request,
-                attraction_research,
-                hotel_research,
-                restaurant_catalog,
-                hotel_research.recommended_hotel or (hotel_research.candidates[0] if hotel_research.candidates else None),
-                attraction_research.recommended_night_area,
-            )
-            self._emit_progress(
-                progress_callback,
-                stage="finalize",
-                percent=96,
-                title="整理可视化报告",
-                detail="正在汇总预算、风险、搜索计划和详细路径。",
-            )
-            return llm_plan
-
+        daily_stays = llm_plan.daily_stays
+        llm_plan.planning_source = "llm_generated"
+        llm_plan.attraction_data_source = attraction_source
+        llm_plan.weather_data_source = weather_source
+        llm_plan.hotel_data_source = hotel_source
+        llm_plan.attraction_search_plan = attraction_research.search_plan
+        llm_plan.preference_interpretation = attraction_research.preference_interpretation
+        llm_plan.agent_diagnostics = attraction_research.agent_diagnostics
+        llm_plan.hotel_candidates = hotel_research.candidates[:]
         self._emit_progress(
             progress_callback,
-            stage="program_plan",
-            percent=78,
-            title="程序组装行程",
-            detail="LLM 行程不可用时，正在用已校验的候选数据组装稳定计划。",
+            stage="route",
+            percent=84,
+            title="高德路线规划",
+            detail="正在为每日地点链计算详细交通路线和备选方案。",
         )
-        plan = self._build_programmatic_plan(
-            request=request,
-            attractions=attraction_research,
-            weather=weather_research,
-            hotels=hotel_research,
-            restaurant_catalog=restaurant_catalog,
-            attraction_source=attraction_source,
-            weather_source=weather_source,
-            hotel_source=hotel_source,
+        self._inject_transport_details(
+            llm_plan,
+            request,
+            attraction_research,
+            hotel_research,
+            restaurant_catalog,
+            daily_stays,
         )
+        self._refresh_plan_budget(llm_plan, request, daily_stays)
         self._emit_progress(
             progress_callback,
             stage="finalize",
@@ -372,7 +369,7 @@ class TravelPlannerService:
             title="整理可视化报告",
             detail="正在汇总预算、风险、搜索计划和详细路径。",
         )
-        return plan
+        return llm_plan
 
     def _emit_progress(
         self,
@@ -410,9 +407,25 @@ class TravelPlannerService:
                 self.attraction_tool_registry.register_tool(quota_tool)
             elif tool.name == "travel_get_city_profile":
                 self.attraction_tool_registry.register_tool(tool)
+            elif tool.name == "travel_search_hotels":
+                hotel_tool = QuotaToolWrapper(
+                    tool,
+                    max_calls=8,
+                    duplicate_key_params=("city", "budget_min", "budget_max", "hotel_style", "area_hint", "search_focus"),
+                )
+                self._hotel_candidate_tools.append(hotel_tool)
+                self.hotel_tool_registry.register_tool(hotel_tool)
 
     def _reset_attraction_tool_quotas(self) -> None:
         for tool in self._attraction_quota_tools:
+            tool.reset_quota()
+
+    def _extend_attraction_tool_quotas(self, extra_calls: int) -> None:
+        for tool in self._attraction_quota_tools:
+            tool.extend_quota(extra_calls)
+
+    def _reset_hotel_tool_quotas(self) -> None:
+        for tool in self._hotel_candidate_tools:
             tool.reset_quota()
 
     def _attraction_candidate_pool(self) -> list[dict[str, Any]]:
@@ -421,6 +434,17 @@ class TravelPlannerService:
         for tool in self._attraction_quota_tools:
             for item in tool.candidate_pool():
                 key = str(item.get("candidate_id") or item.get("name") or "").strip()
+                if key and key not in seen:
+                    seen.add(key)
+                    pool.append(item)
+        return pool
+
+    def _hotel_candidate_pool(self) -> list[dict[str, Any]]:
+        pool: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for tool in self._hotel_candidate_tools:
+            for item in tool.candidate_pool():
+                key = str(item.get("name") or item.get("candidate_id") or "").strip()
                 if key and key not in seen:
                     seen.add(key)
                     pool.append(item)
@@ -440,6 +464,1469 @@ class TravelPlannerService:
                 "taboos": request.taboos,
             },
         )
+
+    def _build_constraint_context(self, request: TravelRequest) -> dict[str, Any]:
+        positive_labels = [PREFERENCE_LABELS.get(pref, pref) for pref in request.preferences]
+        extra_positive = self._split_user_intent_text(request.extra_preferences)
+        negative = self._split_user_intent_text(request.taboos)
+        joined_negative = "，".join(negative)
+        joined_positive = "，".join(positive_labels + extra_positive)
+
+        diet_constraints: list[str] = []
+        mobility_constraints: list[str] = []
+        hotel_constraints: list[str] = []
+        dining_keywords_to_avoid: list[str] = []
+        attraction_keywords_to_avoid: list[str] = []
+
+        if any(token in joined_negative for token in ("不吃辣", "不要辣", "不能吃辣", "忌辣", "怕辣")):
+            diet_constraints.extend(["不吃辣", "偏清淡"])
+            dining_keywords_to_avoid.extend(["辣", "麻辣", "川菜", "湘菜", "辣炒", "麻辣烫", "香辣"])
+        if any(token in joined_negative for token in ("素食", "吃素", "不吃肉")):
+            diet_constraints.append("素食或少肉")
+        if any(token in joined_negative for token in ("清真", "不吃猪")):
+            diet_constraints.append("清真或避开猪肉")
+        if any(token in joined_negative for token in ("不想爬山", "不要爬山", "少爬山", "不徒步", "少走路")):
+            mobility_constraints.append("减少爬山和高强度步行")
+            attraction_keywords_to_avoid.extend(["爬山", "登山", "徒步", "山岳", "山顶"])
+        if any(token in joined_negative for token in ("怕吵", "安静", "不要吵", "睡眠浅")):
+            hotel_constraints.append("住宿优先安静，避开过度夜生活核心噪音区")
+        if any(token in joined_positive for token in ("美食", "小吃", "夜市")):
+            hotel_constraints.append("兼顾餐饮聚集区，但不能牺牲用户忌讳")
+        if any(token in joined_positive for token in ("夜生活", "酒吧", "夜景")):
+            hotel_constraints.append("可靠近夜间活动区域，但要兼顾安全和安静")
+        if request.transit_preference == "less_walking":
+            mobility_constraints.append("公共交通少步行优先")
+
+        return {
+            "positive_preferences": positive_labels + extra_positive,
+            "negative_constraints": negative,
+            "diet_constraints": diet_constraints,
+            "mobility_constraints": mobility_constraints,
+            "hotel_constraints": hotel_constraints,
+            "budget": {"min": request.budget_min, "max": request.budget_max},
+            "pace": request.pace,
+            "travelers": request.travelers,
+            "hotel_style": request.hotel_style,
+            "transport_mode": request.transport_mode,
+            "transit_preference": request.transit_preference,
+            "keywords_to_avoid": {
+                "dining": sorted(set(dining_keywords_to_avoid)),
+                "attractions": sorted(set(attraction_keywords_to_avoid)),
+            },
+            "agent_instructions": {
+                "attraction": "景点选择必须遵守负向约束，例如不想爬山就避开明显登山/徒步/山岳强度景点。",
+                "hotel": "酒店选择必须结合预算、节奏、交通便利性、安静程度和夜间区域偏好。",
+                "weather": "天气建议要结合用户约束，例如少走路、怕晒、老人儿童等。",
+                "itinerary": "最终餐饮、每日节奏、酒店换住和预算都必须落实用户偏好与忌讳。",
+            },
+        }
+
+    def _hotel_rotation_policy(self, request: TravelRequest) -> dict[str, Any]:
+        interval = {"intense": 1, "balanced": 2, "relaxed": 3}.get(request.pace, 2)
+        stay_nights = max(request.stay_nights, 0)
+        target = math.ceil(stay_nights / interval) if stay_nights else 0
+        return {
+            "pace": request.pace,
+            "stay_nights": stay_nights,
+            "interval_nights": interval,
+            "target_hotel_count": max(target, 1 if stay_nights else 0),
+            "rule": f"{self._pace_label(request.pace)}节奏：每 {interval} 晚更换一次住宿；最后一天不新增住宿晚数。",
+        }
+
+    def _build_attraction_research_with_repair(
+        self,
+        request: TravelRequest,
+        profile: AttractionResearch,
+        constraint_context: dict[str, Any],
+    ) -> AttractionResearch:
+        self._reset_attraction_tool_quotas()
+        target_count = self._target_attraction_count(request)
+        previous_data: dict[str, Any] | None = None
+        errors: list[str] = []
+        current_count = 0
+        max_attempts = 3
+        best_grounded: AttractionResearch | None = None
+
+        for attempt in range(max_attempts):
+            if attempt == 0:
+                data, diagnostics = self.attraction_agent.research(
+                    request,
+                    constraint_context=constraint_context,
+                    target_count=target_count,
+                )
+            else:
+                self._extend_attraction_tool_quotas(self._repair_attraction_tool_budget(target_count, current_count))
+                data, diagnostics = self.attraction_agent.repair(
+                    request,
+                    errors=errors,
+                    candidate_pool_preview=self._candidate_pool_preview(self._attraction_candidate_pool()),
+                    previous_data=previous_data,
+                    constraint_context=constraint_context,
+                    target_count=target_count,
+                    current_count=current_count,
+                    shortage_count=max(target_count - current_count, 0),
+                )
+            previous_data = data
+
+            schema = self._validate_schema(data, AttractionResearch, "景点 Agent")
+            if not schema.ok:
+                errors = schema.error_list
+                continue
+            candidate = schema.value
+            assert isinstance(candidate, AttractionResearch)
+            candidate.agent_diagnostics = {**diagnostics, **dict(candidate.agent_diagnostics or {})}
+
+            grounding = self._validate_agent_attraction_research(candidate, profile, self._attraction_candidate_pool(), constraint_context)
+            current_count = grounding.current_count
+            if not grounding.ok:
+                errors = grounding.error_list
+                continue
+
+            grounded = grounding.value
+            assert isinstance(grounded, AttractionResearch)
+            count_result = self._validate_attraction_quantity(grounded, target_count)
+            current_count = count_result.current_count
+            if not count_result.ok:
+                if 0 < current_count < target_count:
+                    best_grounded = grounded
+                errors = count_result.error_list
+                continue
+            return grounded
+
+        if best_grounded is not None and best_grounded.selected_attractions:
+            best_grounded.agent_diagnostics = {
+                **dict(best_grounded.agent_diagnostics or {}),
+                "quantity_shortage_degraded": True,
+                "target_attraction_count": target_count,
+                "final_verified_attraction_count": len(best_grounded.selected_attractions),
+                "attraction_shortage_count": max(target_count - len(best_grounded.selected_attractions), 0),
+                "repair_rounds_used": max_attempts - 1,
+                "quantity_errors": errors[:8],
+            }
+            return best_grounded
+
+        raise ValueError("景点 Agent 多次修复后仍未通过三层校验：" + "；".join(errors[:8]))
+
+    def _build_weather_research_with_repair(
+        self,
+        request: TravelRequest,
+        constraint_context: dict[str, Any],
+    ) -> WeatherResearch:
+        previous_data: dict[str, Any] | None = None
+        errors: list[str] = []
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            if attempt == 0:
+                data, _diagnostics = self.weather_agent.research(request, constraint_context=constraint_context)
+            else:
+                data, _diagnostics = self.weather_agent.repair(
+                    request,
+                    errors=errors,
+                    previous_data=previous_data,
+                    constraint_context=constraint_context,
+                )
+            previous_data = data
+            schema = self._validate_schema(data, WeatherResearch, "天气 Agent")
+            if not schema.ok:
+                errors = schema.error_list
+                continue
+            weather = schema.value
+            assert isinstance(weather, WeatherResearch)
+            grounding = self._validate_weather_research(weather, request)
+            if not grounding.ok:
+                errors = grounding.error_list
+                continue
+            return weather
+        raise ValueError("天气 Agent 多次修复后仍未通过三层校验：" + "；".join(errors[:8]))
+
+    def _build_hotel_research_with_repair(
+        self,
+        request: TravelRequest,
+        constraint_context: dict[str, Any],
+        rotation_policy: dict[str, Any],
+    ) -> HotelResearch:
+        self._reset_hotel_tool_quotas()
+        target_count = int(rotation_policy.get("target_hotel_count", 1) or 1)
+        previous_data: dict[str, Any] | None = None
+        errors: list[str] = []
+        current_count = 0
+        max_attempts = 3
+
+        for attempt in range(max_attempts):
+            if attempt == 0:
+                data, _diagnostics = self.hotel_agent.research(
+                    request,
+                    constraint_context=constraint_context,
+                    rotation_policy=rotation_policy,
+                )
+            else:
+                data, _diagnostics = self.hotel_agent.repair(
+                    request,
+                    errors=errors,
+                    candidate_pool_preview=self._candidate_pool_preview(self._hotel_candidate_pool()),
+                    previous_data=previous_data,
+                    constraint_context=constraint_context,
+                    rotation_policy=rotation_policy,
+                    current_count=current_count,
+                    shortage_count=max(target_count - current_count, 0),
+                )
+            previous_data = data
+
+            schema = self._validate_schema(data, HotelResearch, "酒店 Agent")
+            if not schema.ok:
+                errors = schema.error_list
+                continue
+            candidate = schema.value
+            assert isinstance(candidate, HotelResearch)
+            grounding = self._validate_agent_hotel_research(candidate, self._hotel_candidate_pool(), constraint_context)
+            current_count = grounding.current_count
+            if not grounding.ok:
+                errors = grounding.error_list
+                continue
+            grounded = grounding.value
+            assert isinstance(grounded, HotelResearch)
+            count_result = self._validate_hotel_quantity(grounded, target_count)
+            current_count = count_result.current_count
+            if not count_result.ok:
+                errors = count_result.error_list
+                continue
+            return grounded
+
+        raise ValueError("酒店 Agent 多次修复后仍未通过三层校验：" + "；".join(errors[:8]))
+
+    def _build_trip_plan_with_repair(
+        self,
+        request: TravelRequest,
+        attraction_research: AttractionResearch,
+        weather_research: WeatherResearch,
+        hotel_research: HotelResearch,
+        constraint_context: dict[str, Any],
+        hotel_rotation_policy: dict[str, Any],
+        restaurant_catalog: dict[str, list[RestaurantOption]],
+    ) -> TripPlan:
+        try:
+            return self._build_trip_plan_by_day_with_repair(
+                request,
+                attraction_research,
+                weather_research,
+                hotel_research,
+                constraint_context,
+                hotel_rotation_policy,
+            )
+        except ValueError as exc:
+            raise ValueError("按天生成最终行程失败：" + str(exc)) from exc
+
+    def _build_trip_plan_by_day_with_repair(
+        self,
+        request: TravelRequest,
+        attraction_research: AttractionResearch,
+        weather_research: WeatherResearch,
+        hotel_research: HotelResearch,
+        constraint_context: dict[str, Any],
+        hotel_rotation_policy: dict[str, Any],
+    ) -> TripPlan:
+        skeleton = self._build_skeleton_with_repair(
+            request,
+            attraction_research,
+            weather_research,
+            hotel_research,
+            constraint_context,
+            hotel_rotation_policy,
+        )
+        daily_plans: list[DayPlan] = []
+        for day_index in range(1, request.trip_days + 1):
+            day_plan = self._build_day_plan_with_repair(
+                request,
+                day_index,
+                skeleton,
+                attraction_research,
+                weather_research,
+                hotel_research,
+                constraint_context,
+            )
+            daily_plans.append(day_plan)
+
+        recommended_hotel = skeleton["recommended_hotel"]
+        plan = TripPlan(
+            city=request.city,
+            travel_theme=str(skeleton["travel_theme"]),
+            overview=str(skeleton["overview"]),
+            trip_days=request.trip_days,
+            planning_source="llm_generated_by_day",
+            selected_attractions=attraction_research.selected_attractions[:],
+            recommended_hotel=recommended_hotel,
+            hotel_candidates=hotel_research.candidates[:],
+            daily_stays=skeleton["daily_stays"],
+            daily_plans=daily_plans,
+            budget=BudgetBreakdown(
+                hotel=0.0,
+                attractions=0.0,
+                food=0.0,
+                transport=0.0,
+                contingency=0.0,
+                total=0.0,
+            ),
+            packing_tips=list(skeleton.get("packing_tips") or self._packing_tips(weather_research)),
+            risk_alerts=list(skeleton.get("risk_alerts") or weather_research.risk_days),
+            notes=list(skeleton.get("notes") or []),
+        )
+        self._refresh_plan_budget(plan, request, plan.daily_stays)
+        grounding = self._validate_trip_plan_grounding(
+            plan,
+            request,
+            attraction_research,
+            hotel_research,
+            {},
+            constraint_context,
+            hotel_rotation_policy,
+        )
+        if not grounding.ok:
+            raise ValueError("按天生成最终行程未通过校验：" + "；".join(grounding.error_list[:10]))
+        assert isinstance(grounding.value, TripPlan)
+        return grounding.value
+
+    def _build_skeleton_with_repair(
+        self,
+        request: TravelRequest,
+        attraction_research: AttractionResearch,
+        weather_research: WeatherResearch,
+        hotel_research: HotelResearch,
+        constraint_context: dict[str, Any],
+        hotel_rotation_policy: dict[str, Any],
+    ) -> dict[str, Any]:
+        previous_data: dict[str, Any] | None = None
+        errors: list[str] = []
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            if attempt == 0:
+                data, _diagnostics = self.itinerary_agent.plan_skeleton(
+                    request,
+                    attraction_research,
+                    weather_research,
+                    hotel_research,
+                    constraint_context=constraint_context,
+                    hotel_rotation_policy=hotel_rotation_policy,
+                )
+            else:
+                data, _diagnostics = self.itinerary_agent.repair_skeleton(
+                    request,
+                    attraction_research,
+                    weather_research,
+                    hotel_research,
+                    errors=errors,
+                    previous_data=previous_data,
+                    constraint_context=constraint_context,
+                    hotel_rotation_policy=hotel_rotation_policy,
+                )
+            previous_data = data
+            normalized = self._normalize_skeleton_data(data, request, attraction_research, hotel_research)
+            if normalized.ok:
+                assert isinstance(normalized.value, dict)
+                return normalized.value
+            errors = normalized.error_list
+        raise ValueError("最终行程骨架多次修复后仍未通过校验：" + "；".join(errors[:10]))
+
+    def _build_day_plan_with_repair(
+        self,
+        request: TravelRequest,
+        day_index: int,
+        skeleton: dict[str, Any],
+        attraction_research: AttractionResearch,
+        weather_research: WeatherResearch,
+        hotel_research: HotelResearch,
+        constraint_context: dict[str, Any],
+    ) -> DayPlan:
+        day_context = self._day_generation_context(
+            request,
+            day_index,
+            skeleton,
+            attraction_research,
+            weather_research,
+        )
+        previous_data: dict[str, Any] | None = None
+        errors: list[str] = []
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            if attempt == 0:
+                data, _diagnostics = self.itinerary_agent.plan_day(
+                    request,
+                    day_context=day_context,
+                    constraint_context=constraint_context,
+                )
+            else:
+                data, _diagnostics = self.itinerary_agent.repair_day(
+                    request,
+                    day_context=day_context,
+                    constraint_context=constraint_context,
+                    errors=errors,
+                    previous_data=previous_data,
+                )
+            previous_data = data
+            schema = self._validate_schema(data, DayPlan, f"第 {day_index} 天行程 Agent")
+            if not schema.ok:
+                errors = schema.error_list
+                continue
+            day = schema.value
+            assert isinstance(day, DayPlan)
+            self._materialize_meal_intents(day, request, day_context, constraint_context)
+            validation = self._validate_day_plan_from_skeleton(
+                day,
+                request,
+                day_index,
+                skeleton,
+                attraction_research,
+                hotel_research,
+                constraint_context,
+            )
+            if validation.ok:
+                assert isinstance(validation.value, DayPlan)
+                return validation.value
+            errors = validation.error_list
+        raise ValueError(f"第 {day_index} 天行程多次修复后仍未通过校验：" + "；".join(errors[:10]))
+
+    def _validate_schema(
+        self,
+        data: dict[str, Any] | None,
+        model: type[BaseModel],
+        agent_label: str,
+    ) -> AgentValidationResult:
+        if not isinstance(data, dict):
+            return AgentValidationResult(False, errors=[f"{agent_label} 第一层 JSON 格式校验失败：未返回可解析 JSON 对象。"])
+        try:
+            value = model.model_validate(data)
+        except ValidationError as exc:
+            errors = []
+            for error in exc.errors()[:12]:
+                loc = ".".join(str(part) for part in error.get("loc", [])) or "<root>"
+                errors.append(f"{agent_label} 第一层 JSON 结构错误：{loc}: {error.get('msg', '')}")
+            return AgentValidationResult(False, errors=errors)
+        except Exception as exc:
+            return AgentValidationResult(False, errors=[f"{agent_label} 第一层 JSON 结构错误：{type(exc).__name__}: {exc}"])
+        return AgentValidationResult(True, value=value)
+
+    def _normalize_skeleton_data(
+        self,
+        data: dict[str, Any] | None,
+        request: TravelRequest,
+        attractions: AttractionResearch,
+        hotels: HotelResearch,
+    ) -> AgentValidationResult:
+        if not isinstance(data, dict):
+            return AgentValidationResult(False, errors=["最终行程骨架第一层 JSON 格式校验失败：未返回可解析 JSON 对象。"])
+
+        errors: list[str] = []
+        attraction_catalog = {item.name: item for item in attractions.selected_attractions}
+        hotel_catalog = {item.name: item for item in hotels.candidates}
+        if not attraction_catalog:
+            errors.append("最终行程骨架第二层验真失败：已验真景点池为空。")
+        if not hotel_catalog:
+            errors.append("最终行程骨架第二层验真失败：已验真酒店池为空。")
+
+        recommended_name = str(data.get("recommended_hotel_name") or "").strip()
+        resolved_recommended = self._resolve_place_name(recommended_name, hotel_catalog)
+        if not resolved_recommended:
+            errors.append("最终行程骨架第二层验真失败：recommended_hotel_name 必须来自酒店白名单。")
+            recommended_hotel = None
+        else:
+            recommended_hotel = hotel_catalog[resolved_recommended]
+
+        stays_raw = data.get("daily_stays")
+        if not isinstance(stays_raw, list):
+            errors.append("最终行程骨架第一层 JSON 结构错误：daily_stays 必须是数组。")
+            stays_raw = []
+        if len(stays_raw) != request.trip_days:
+            errors.append(f"最终行程骨架第三层数量校验失败：daily_stays 应为 {request.trip_days} 天，实际 {len(stays_raw)} 天。")
+
+        daily_stays: list[DailyStayPlan] = []
+        previous_end: HotelOption | None = None
+        for index in range(request.trip_days):
+            raw = stays_raw[index] if index < len(stays_raw) and isinstance(stays_raw[index], dict) else {}
+            day_number = index + 1
+            current_date = request.start_date + timedelta(days=index)
+            start_name = str(raw.get("start_hotel_name") or raw.get("start_hotel") or "").strip()
+            end_name = str(raw.get("end_hotel_name") or raw.get("end_hotel") or "").strip()
+            start_resolved = self._resolve_place_name(start_name, hotel_catalog)
+            end_resolved = self._resolve_place_name(end_name, hotel_catalog)
+            if index > 0 and previous_end is not None:
+                start_hotel = previous_end
+                if start_resolved and start_resolved != previous_end.name:
+                    errors.append(f"最终行程骨架第二层验真失败：第 {day_number} 天 start_hotel_name 应等于前一天 end_hotel_name。")
+            else:
+                start_hotel = hotel_catalog[start_resolved] if start_resolved else recommended_hotel
+            if not start_hotel:
+                errors.append(f"最终行程骨架第二层验真失败：第 {day_number} 天 start_hotel_name 必须来自酒店白名单。")
+
+            charged_night = bool(raw.get("charged_night", index < request.stay_nights))
+            if index >= request.stay_nights:
+                charged_night = False
+            if charged_night:
+                end_hotel = hotel_catalog[end_resolved] if end_resolved else start_hotel
+                if not end_hotel:
+                    errors.append(f"最终行程骨架第二层验真失败：第 {day_number} 天 end_hotel_name 必须来自酒店白名单。")
+            else:
+                end_hotel = start_hotel
+
+            hotel_changed = (
+                charged_night
+                and start_hotel is not None
+                and end_hotel is not None
+                and start_hotel.name != end_hotel.name
+            )
+            daily_stays.append(
+                DailyStayPlan(
+                    day_index=day_number,
+                    date=current_date,
+                    start_hotel=start_hotel,
+                    end_hotel=end_hotel,
+                    night_area=str(raw.get("night_area") or ""),
+                    charged_night=charged_night,
+                    hotel_changed=hotel_changed,
+                    reason=str(raw.get("reason") or ""),
+                )
+            )
+            if charged_night and end_hotel is not None:
+                previous_end = end_hotel
+
+        charged_count = sum(1 for stay in daily_stays if stay.charged_night)
+        if charged_count != request.stay_nights:
+            errors.append(f"最终行程骨架第三层数量校验失败：charged_night=true 应为 {request.stay_nights} 晚，实际 {charged_count} 晚。")
+        if daily_stays and daily_stays[-1].charged_night and request.trip_days > 1:
+            errors.append("最终行程骨架第三层数量校验失败：最后一天 charged_night 必须为 false。")
+
+        assignments_raw = data.get("daily_attraction_assignments")
+        if not isinstance(assignments_raw, list):
+            errors.append("最终行程骨架第一层 JSON 结构错误：daily_attraction_assignments 必须是数组。")
+            assignments_raw = []
+        if len(assignments_raw) != request.trip_days:
+            errors.append(
+                f"最终行程骨架第三层数量校验失败：daily_attraction_assignments 应为 {request.trip_days} 天，实际 {len(assignments_raw)} 天。"
+            )
+
+        expected_daily_counts = self._expected_daily_attraction_counts(request, len(attraction_catalog))
+        assignments: dict[int, list[Attraction]] = {}
+        used_attractions: set[str] = set()
+        for index in range(request.trip_days):
+            raw = assignments_raw[index] if index < len(assignments_raw) and isinstance(assignments_raw[index], dict) else {}
+            day_number = index + 1
+            names = raw.get("attraction_names") if isinstance(raw.get("attraction_names"), list) else []
+            expected_count = expected_daily_counts[index] if index < len(expected_daily_counts) else 0
+            if len(names) != expected_count:
+                errors.append(f"最终行程骨架第三层数量校验失败：第 {day_number} 天应分配 {expected_count} 个景点，实际 {len(names)} 个。")
+            day_attractions: list[Attraction] = []
+            for raw_name in names:
+                resolved = self._resolve_place_name(str(raw_name), attraction_catalog)
+                if not resolved:
+                    errors.append(f"最终行程骨架第二层验真失败：第 {day_number} 天景点「{raw_name}」不在景点白名单。")
+                    continue
+                if resolved in used_attractions:
+                    errors.append(f"最终行程骨架第二层验真失败：景点「{resolved}」被重复分配。")
+                    continue
+                used_attractions.add(resolved)
+                day_attractions.append(attraction_catalog[resolved])
+            assignments[day_number] = day_attractions
+
+        errors.extend(
+            self._hotel_rotation_sequence_errors(
+                daily_stays,
+                request,
+                self._hotel_rotation_policy(request),
+                available_hotel_count=len(hotel_catalog),
+                label="最终行程骨架",
+            )
+        )
+
+        if errors:
+            return AgentValidationResult(False, errors=errors[:16], current_count=len(assignments))
+
+        return AgentValidationResult(
+            True,
+            value={
+                "city": request.city,
+                "travel_theme": str(data.get("travel_theme") or "城市旅行"),
+                "overview": str(data.get("overview") or ""),
+                "recommended_hotel": recommended_hotel,
+                "daily_stays": daily_stays,
+                "assignments": assignments,
+                "packing_tips": list(data.get("packing_tips") or []),
+                "risk_alerts": list(data.get("risk_alerts") or []),
+                "notes": list(data.get("notes") or []),
+            },
+            current_count=len(assignments),
+        )
+
+    def _day_generation_context(
+        self,
+        request: TravelRequest,
+        day_index: int,
+        skeleton: dict[str, Any],
+        attractions: AttractionResearch,
+        weather: WeatherResearch,
+    ) -> dict[str, Any]:
+        current_date = request.start_date + timedelta(days=day_index - 1)
+        forecast_by_date = {item.date: item for item in weather.forecast}
+        weather_info = forecast_by_date.get(current_date)
+        if weather_info is None and weather.forecast:
+            weather_info = weather.forecast[min(day_index - 1, len(weather.forecast) - 1)]
+        assigned = skeleton.get("assignments", {}).get(day_index, [])
+        stay = self._stay_for_day(skeleton.get("daily_stays", []), day_index - 1, request)
+        return {
+            "day_index": day_index,
+            "date": current_date.isoformat(),
+            "start_hotel": stay.start_hotel.model_dump(mode="json") if stay.start_hotel else None,
+            "end_hotel": stay.end_hotel.model_dump(mode="json") if stay.end_hotel else None,
+            "night_area": stay.night_area,
+            "charged_night": stay.charged_night,
+            "hotel_changed": stay.hotel_changed,
+            "stay_reason": stay.reason,
+            "weather": weather_info.model_dump(mode="json") if weather_info else {},
+            "assigned_attractions": [item.model_dump(mode="json") for item in assigned],
+            "all_attraction_names": [item.name for item in attractions.selected_attractions],
+        }
+
+    def _validate_day_plan_from_skeleton(
+        self,
+        day: DayPlan,
+        request: TravelRequest,
+        day_index: int,
+        skeleton: dict[str, Any],
+        attractions: AttractionResearch,
+        hotels: HotelResearch,
+        constraint_context: dict[str, Any],
+    ) -> AgentValidationResult:
+        errors: list[str] = []
+        current_date = request.start_date + timedelta(days=day_index - 1)
+        if day.date != current_date:
+            errors.append(f"第 {day_index} 天行程第三层数量校验失败：date 应为 {current_date.isoformat()}，实际 {day.date.isoformat()}。")
+
+        assigned = skeleton.get("assignments", {}).get(day_index, [])
+        assigned_catalog = {item.name: item for item in assigned}
+        all_attraction_catalog = {item.name: item for item in attractions.selected_attractions}
+        hotel_catalog = {item.name: item for item in hotels.candidates}
+        expected_names = set(assigned_catalog)
+        used_names: set[str] = set()
+        meal_types: set[str] = set()
+        avoid_dining = constraint_context.get("keywords_to_avoid", {}).get("dining", []) or []
+
+        if not day.meal_intents:
+            errors.append(f"第 {day_index} 天行程第一层 JSON 结构错误：必须输出 meal_intents，不能直接编造餐饮 item。")
+
+        for item in day.items:
+            if item.item_type == "attraction":
+                resolved = self._resolve_place_name(item.location_name or item.title, assigned_catalog)
+                if not resolved:
+                    if self._resolve_place_name(item.location_name or item.title, all_attraction_catalog):
+                        errors.append(f"第 {day_index} 天行程第二层验真失败：景点「{item.location_name or item.title}」不属于当天分配景点。")
+                    else:
+                        errors.append(f"第 {day_index} 天行程第二层验真失败：景点「{item.location_name or item.title}」不在已验真景点池。")
+                    continue
+                if resolved in used_names:
+                    errors.append(f"第 {day_index} 天行程第二层验真失败：景点「{resolved}」当天重复安排。")
+                    continue
+                used_names.add(resolved)
+                attraction = assigned_catalog[resolved]
+                item.title = resolved
+                item.location_name = resolved
+                item.location_address = attraction.location.address
+                item.estimated_cost = attraction.ticket_price
+            elif item.item_type in {"meal", "food"}:
+                meal_type = str(item.meal_type or "").strip()
+                if meal_type not in {"breakfast", "lunch", "dinner"}:
+                    errors.append(
+                        f"第 {day_index} 天行程第一层/业务校验失败：餐饮「{item.title}」meal_type 必须是 breakfast、lunch、dinner。"
+                    )
+                else:
+                    meal_types.add(meal_type)
+                meal_text = f"{item.title} {item.location_name} {item.summary} {item.reason}"
+                violated = self._constraint_keyword_violations(meal_text, avoid_dining)
+                if violated:
+                    errors.append(f"第 {day_index} 天行程第二层偏好/忌讳验真失败：餐饮「{item.title}」命中忌讳关键词 {violated}。")
+                if item.estimated_cost < 0:
+                    errors.append(f"第 {day_index} 天行程第一层/业务校验失败：餐饮「{item.title}」estimated_cost 不能为负数。")
+                resolved_anchor = self._resolve_route_anchor(
+                    item.location_name or item.title,
+                    attraction_catalog=all_attraction_catalog,
+                    hotel_catalog=hotel_catalog,
+                    restaurant_catalog={},
+                    region_candidates=self._collect_region_candidates(attractions, hotels, skeleton.get("daily_stays", [])),
+                )
+                if not resolved_anchor and not item.is_route_stop:
+                    item.location_address = ""
+            elif item.item_type == "transport":
+                errors.append(f"第 {day_index} 天行程第二层验真失败：不要输出 transport item，交通由程序注入。")
+            elif item.item_type == "hotel":
+                errors.append(f"第 {day_index} 天行程第二层验真失败：不要输出 hotel item，换宿节点由程序注入。")
+
+        if used_names != expected_names:
+            missing = sorted(expected_names - used_names)
+            extra = sorted(used_names - expected_names)
+            if missing:
+                errors.append(f"第 {day_index} 天行程第三层数量校验失败：缺少当天分配景点 {missing}。")
+            if extra:
+                errors.append(f"第 {day_index} 天行程第二层验真失败：出现未分配景点 {extra}。")
+
+        if day_index < request.trip_days:
+            missing_meals = {"breakfast", "lunch", "dinner"} - meal_types
+            if missing_meals:
+                errors.append(
+                    f"第 {day_index} 天行程第三层数量校验失败：非最后一天必须包含早餐、午餐、晚餐，缺少 {sorted(missing_meals)}。"
+                )
+        else:
+            stay = self._stay_for_day(skeleton.get("daily_stays", []), day_index - 1, request)
+            if not meal_types:
+                errors.append(f"第 {day_index} 天行程第三层数量校验失败：最后一天至少需要 1 个餐饮 intent。")
+            if self._day_has_night_activity(day, stay) and "dinner" not in meal_types:
+                errors.append(f"第 {day_index} 天行程第三层数量校验失败：最后一天有夜间活动，因此必须包含晚餐 item。")
+
+        if errors:
+            return AgentValidationResult(False, errors=errors[:12], current_count=len(day.items))
+        return AgentValidationResult(True, value=day, current_count=len(day.items))
+
+    def _materialize_meal_intents(
+        self,
+        day: DayPlan,
+        request: TravelRequest,
+        day_context: dict[str, Any],
+        constraint_context: dict[str, Any],
+    ) -> None:
+        if not day.meal_intents:
+            return
+
+        existing_non_meals = [
+            item
+            for item in day.items
+            if item.item_type not in {"meal", "food"}
+        ]
+        meal_items = [
+            self._meal_item_from_intent(intent, request, day_context, constraint_context)
+            for intent in day.meal_intents
+        ]
+        day.items = self._merge_meal_items_by_time(existing_non_meals, meal_items)
+
+    def _meal_item_from_intent(
+        self,
+        intent: MealIntent,
+        request: TravelRequest,
+        day_context: dict[str, Any],
+        constraint_context: dict[str, Any],
+    ) -> DayPlanItem:
+        restaurant = self._search_restaurant_for_intent(intent, request, day_context, constraint_context)
+        if restaurant is not None:
+            total_cost = round(max(restaurant.avg_cost_per_person * request.travelers, intent.budget_total, 0.0), 2)
+            return DayPlanItem(
+                time_range=intent.time_range,
+                title=restaurant.name,
+                item_type="meal",
+                meal_type=intent.meal_type,
+                location_name=restaurant.name,
+                location_address=restaurant.location.address,
+                summary=self._meal_summary(intent, restaurant),
+                estimated_cost=total_cost,
+                reason=intent.reason or f"按{self._meal_type_label(intent.meal_type)}意图匹配真实餐饮 POI。",
+                is_route_stop=True,
+            )
+
+        anchor = self._best_meal_anchor(intent, day_context)
+        return DayPlanItem(
+            time_range=intent.time_range,
+            title=f"{self._meal_type_label(intent.meal_type)}区域餐饮建议",
+            item_type="meal",
+            meal_type=intent.meal_type,
+            location_name=f"{anchor}附近" if anchor else "附近餐饮区域",
+            location_address="",
+            summary=(
+                f"建议在{anchor or '当天路线附近'}选择{intent.cuisine_intent or '本地餐饮'}。"
+                "高德未找到足够可信的具体餐厅 POI，因此不绑定具体地址。"
+            ),
+            estimated_cost=round(max(intent.budget_total, 0.0), 2),
+            reason=intent.reason or "餐饮意图保留为区域建议，不参与详细交通路线。",
+            is_route_stop=False,
+        )
+
+    def _search_restaurant_for_intent(
+        self,
+        intent: MealIntent,
+        request: TravelRequest,
+        day_context: dict[str, Any],
+        constraint_context: dict[str, Any],
+    ) -> RestaurantOption | None:
+        avoid = list(dict.fromkeys(
+            list(intent.must_avoid or [])
+            + list((constraint_context.get("keywords_to_avoid") or {}).get("dining", []) or [])
+        ))
+        anchors = self._meal_search_anchors(intent, day_context)
+        searches = self._meal_search_terms(intent)
+        for anchor in anchors:
+            for preferences, radius_m in searches:
+                try:
+                    payload = self.backend.search_restaurants(
+                        city=request.city,
+                        anchor=anchor,
+                        preferences=preferences,
+                        budget_hint=max(intent.budget_total, 0.0),
+                        travelers=request.travelers,
+                        radius_m=radius_m,
+                    )
+                except Exception:
+                    continue
+                for raw in payload.get("restaurants") or []:
+                    try:
+                        option = RestaurantOption.model_validate(raw)
+                    except Exception:
+                        continue
+                    if self._restaurant_matches_intent(option, avoid):
+                        return option
+        return None
+
+    def _meal_search_anchors(self, intent: MealIntent, day_context: dict[str, Any]) -> list[str]:
+        anchors: list[str] = []
+
+        def add(value: Any) -> None:
+            cleaned = self._sanitize_place_name(str(value or ""))
+            if cleaned and cleaned not in anchors:
+                anchors.append(cleaned)
+
+        add(intent.anchor_name)
+        meal_type = str(intent.meal_type)
+        start_hotel = day_context.get("start_hotel") or {}
+        end_hotel = day_context.get("end_hotel") or {}
+        assigned = day_context.get("assigned_attractions") or []
+        if meal_type == "breakfast":
+            add(start_hotel.get("name"))
+            add((start_hotel.get("location") or {}).get("name"))
+        elif meal_type == "lunch":
+            middle = assigned[min(len(assigned) // 2, len(assigned) - 1)] if assigned else {}
+            add(middle.get("name"))
+            add((middle.get("location") or {}).get("name"))
+        elif meal_type == "dinner":
+            add(day_context.get("night_area"))
+            if assigned:
+                last = assigned[-1]
+                add(last.get("name"))
+                add((last.get("location") or {}).get("name"))
+            add(end_hotel.get("name"))
+            add((end_hotel.get("location") or {}).get("name"))
+
+        add(day_context.get("night_area"))
+        return anchors
+
+    def _meal_search_terms(self, intent: MealIntent) -> list[tuple[str, int]]:
+        cuisine = self._sanitize_place_name(intent.cuisine_intent)
+        meal_type = str(intent.meal_type)
+        if meal_type == "breakfast":
+            broad = "早餐,粥粉面,早茶,肠粉"
+        elif meal_type == "dinner":
+            broad = "本地菜,特色餐厅,海鲜"
+        else:
+            broad = "本地菜,餐厅,简餐"
+        exact = ",".join(self._split_meal_query_terms(cuisine))
+        relaxed = ",".join(self._split_meal_query_terms(self._meal_query_without_avoid_words(cuisine)))
+        return [
+            (exact or broad, 1200),
+            (relaxed or broad, 2500),
+            (broad, 5000),
+        ]
+
+    def _split_meal_query_terms(self, value: str) -> list[str]:
+        text = value.lower()
+        for marker in ("，", "、", "/", "；", ";", "。"):
+            text = text.replace(marker, ",")
+        blocked = (
+            "不辣",
+            "不要辣",
+            "不能吃辣",
+            "忌辣",
+            "避免",
+            "不要",
+            "不能",
+            "忌",
+            "no",
+            "not",
+            "avoid",
+            "without",
+        )
+        raw_parts: list[str] = []
+        for chunk in text.split(","):
+            words = [word.strip() for word in chunk.split() if word.strip()]
+            if len(words) <= 1:
+                raw_parts.append(chunk)
+                continue
+            skip_next = False
+            for word in words:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if word in {"no", "not", "avoid", "without"}:
+                    skip_next = True
+                    continue
+                raw_parts.append(word)
+
+        terms: list[str] = []
+        for part in raw_parts:
+            term = part.strip().lower()
+            if not term or any(marker in term for marker in blocked):
+                continue
+            if term not in terms:
+                terms.append(term)
+        return terms[:4]
+
+    def _meal_query_without_avoid_words(self, value: str) -> str:
+        text = value
+        for marker in ("不辣", "不要辣", "清淡", "少油", "少盐", "避免", "忌"):
+            text = text.replace(marker, " ")
+        return " ".join(part for part in text.split() if part)
+
+    def _restaurant_matches_intent(self, option: RestaurantOption, avoid: list[str]) -> bool:
+        if not option.name or option.location.lat == 0.0 and option.location.lng == 0.0:
+            return False
+        text = " ".join(
+            [
+                option.name,
+                option.cuisine,
+                option.summary,
+                option.location.name,
+                option.location.address,
+            ]
+        )
+        return not self._constraint_keyword_violations(text, avoid)
+
+    def _best_meal_anchor(self, intent: MealIntent, day_context: dict[str, Any]) -> str:
+        anchors = self._meal_search_anchors(intent, day_context)
+        return anchors[0] if anchors else ""
+
+    def _meal_summary(self, intent: MealIntent, restaurant: RestaurantOption) -> str:
+        parts = [
+            f"按餐饮意图匹配：{intent.cuisine_intent}" if intent.cuisine_intent else "",
+            restaurant.summary,
+            f"靠近{restaurant.nearby_anchor}" if restaurant.nearby_anchor else "",
+            "地址由坐标逆地理编码补全" if restaurant.address_source == "reverse_geocode" else "",
+        ]
+        return "；".join(part for part in parts if part)
+
+    def _merge_meal_items_by_time(
+        self,
+        non_meal_items: list[DayPlanItem],
+        meal_items: list[DayPlanItem],
+    ) -> list[DayPlanItem]:
+        return sorted(
+            non_meal_items + meal_items,
+            key=lambda item: self._time_sort_key(item.time_range),
+        )
+
+    def _time_sort_key(self, value: str) -> tuple[int, str]:
+        text = str(value or "").strip()
+        start = text.split("-", 1)[0].strip()
+        hour_text = start.split(":", 1)[0].strip()
+        if hour_text.isdigit():
+            hour = int(hour_text)
+            if 0 <= hour <= 23:
+                return (hour, text)
+        return (99, text)
+
+    def _meal_type_label(self, meal_type: str) -> str:
+        return {
+            "breakfast": "早餐",
+            "lunch": "午餐",
+            "dinner": "晚餐",
+        }.get(str(meal_type), "餐饮")
+
+    def _candidate_pool_preview(self, candidate_pool: list[dict[str, Any]], limit: int = 20) -> list[dict[str, Any]]:
+        preview: list[dict[str, Any]] = []
+        for item in candidate_pool[:limit]:
+            location = item.get("location") if isinstance(item.get("location"), dict) else {}
+            preview.append(
+                {
+                    "candidate_id": item.get("candidate_id", ""),
+                    "name": item.get("name", ""),
+                    "source_query": item.get("source_query", ""),
+                    "address": item.get("address", "") or location.get("address", ""),
+                    "nearby_area": item.get("nearby_area", ""),
+                    "lat": item.get("lat", "") or location.get("lat", ""),
+                    "lng": item.get("lng", "") or location.get("lng", ""),
+                }
+            )
+        return preview
+
+    def _validate_agent_attraction_research(
+        self,
+        candidate: AttractionResearch,
+        profile: AttractionResearch,
+        candidate_pool: list[dict[str, Any]],
+        constraint_context: dict[str, Any],
+    ) -> AgentValidationResult:
+        errors: list[str] = []
+        diagnostics = dict(candidate.agent_diagnostics or {})
+        diagnostics["candidate_pool_size"] = len(candidate_pool)
+        diagnostics["candidate_selected_count"] = len(candidate.selected_attractions)
+        if not candidate.selected_attractions:
+            errors.append("景点 Agent 第二层验真失败：selected_attractions 为空。")
+        if not candidate_pool:
+            errors.append("景点 Agent 第二层验真失败：本轮工具候选池为空，必须调用 travel_search_attraction_pois。")
+            candidate.agent_diagnostics = diagnostics
+            return AgentValidationResult(False, errors=errors, current_count=0)
+
+        by_id = {
+            self._safe_pool_key(item.get("candidate_id")): item
+            for item in candidate_pool
+            if self._safe_pool_key(item.get("candidate_id"))
+        }
+        by_name = {
+            self._sanitize_place_name(str(item.get("name", ""))): item
+            for item in candidate_pool
+            if self._sanitize_place_name(str(item.get("name", "")))
+        }
+        grounded: list[Attraction] = []
+        seen_names: set[str] = set()
+        avoid_keywords = constraint_context.get("keywords_to_avoid", {}).get("attractions", []) or []
+
+        for item in candidate.selected_attractions:
+            source = (
+                by_id.get(self._safe_pool_key(item.candidate_id))
+                or by_name.get(self._sanitize_place_name(item.name))
+                or by_name.get(self._sanitize_place_name(item.location.name))
+            )
+            if source is None:
+                errors.append(f"景点 Agent 第二层验真失败：「{item.name}」不在本轮工具候选池中。")
+                continue
+
+            name = str(source.get("name") or item.name).strip()
+            if not name:
+                errors.append("景点 Agent 第二层验真失败：工具候选存在空名称。")
+                continue
+            if name in seen_names:
+                errors.append(f"景点 Agent 第二层验真失败：重复景点「{name}」。")
+                continue
+            text = " ".join([name, item.category, item.summary, item.location.address, " ".join(item.tags)])
+            violated = self._constraint_keyword_violations(text, avoid_keywords)
+            if violated:
+                errors.append(f"景点 Agent 第二层偏好/忌讳验真失败：「{name}」命中忌讳关键词 {violated}。")
+                continue
+
+            seen_names.add(name)
+            try:
+                grounded.append(
+                    Attraction.model_validate(
+                        {
+                            "candidate_id": str(source.get("candidate_id") or item.candidate_id or ""),
+                            "source_query": str(source.get("source_query") or item.source_query or ""),
+                            "score": item.score,
+                            "matched_preferences": item.matched_preferences,
+                            "taboo_check": item.taboo_check,
+                            "name": name,
+                            "category": str(source.get("category") or item.category or source.get("source_query") or "景点"),
+                            "tags": item.tags or [str(source.get("source_query") or "景点")],
+                            "summary": item.summary or str(source.get("type") or "真实 POI 景点候选"),
+                            "recommended_hours": item.recommended_hours,
+                            "ticket_price": item.ticket_price,
+                            "best_time": item.best_time,
+                            "location": {
+                                "name": name,
+                                "address": str(source.get("address") or item.location.address or ""),
+                                "lat": float(source.get("lat", 0.0) or 0.0),
+                                "lng": float(source.get("lng", 0.0) or 0.0),
+                            },
+                        }
+                    )
+                )
+            except Exception as exc:
+                errors.append(f"景点 Agent 第二层验真失败：「{name}」无法规范化为 Attraction：{exc}")
+
+        diagnostics["grounded_selected_count"] = len(grounded)
+        if errors:
+            candidate.agent_diagnostics = diagnostics
+            return AgentValidationResult(False, errors=errors[:12], current_count=len(grounded))
+
+        reasoning = list(candidate.selection_reasoning or [])
+        reasoning.append("已通过第二层验真：景点均来自本轮工具候选池，并检查了用户偏好/忌讳。")
+        grounded_research = AttractionResearch(
+            city_overview=candidate.city_overview or profile.city_overview,
+            selected_attractions=grounded,
+            selection_reasoning=reasoning,
+            recommended_night_area=candidate.recommended_night_area or profile.recommended_night_area,
+            search_plan=candidate.search_plan or profile.search_plan,
+            preference_interpretation=candidate.preference_interpretation or profile.preference_interpretation,
+            agent_diagnostics={**diagnostics, "grounding_ok": True},
+        )
+        return AgentValidationResult(True, value=grounded_research, current_count=len(grounded))
+
+    def _validate_attraction_quantity(self, research: AttractionResearch, target_count: int) -> AgentValidationResult:
+        current = len(research.selected_attractions)
+        if current < target_count:
+            return AgentValidationResult(
+                False,
+                errors=[
+                    f"景点 Agent 第三层数量校验失败：目标 {target_count} 个不重复景点，当前通过验真 {current} 个，还缺 {target_count - current} 个。请继续调用工具换 query 扩展候选池。"
+                ],
+                current_count=current,
+            )
+        if current > target_count:
+            return AgentValidationResult(
+                False,
+                errors=[f"景点 Agent 第三层数量校验失败：目标 {target_count} 个景点，但输出 {current} 个，不能超过目标数量。"],
+                current_count=current,
+            )
+        return AgentValidationResult(True, value=research, current_count=current)
+
+    def _validate_weather_research(self, weather: WeatherResearch, request: TravelRequest) -> AgentValidationResult:
+        errors: list[str] = []
+        expected_dates = [request.start_date + timedelta(days=index) for index in range(request.trip_days)]
+        forecast_by_date = {item.date: item for item in weather.forecast}
+        for date_value in expected_dates:
+            if date_value not in forecast_by_date:
+                errors.append(f"天气 Agent 第三层数量校验失败：缺少 {date_value.isoformat()} 的 forecast。")
+        for item in weather.forecast:
+            if item.high_c < item.low_c:
+                errors.append(f"天气 Agent 第二层验真失败：{item.date.isoformat()} high_c 小于 low_c。")
+        if errors:
+            return AgentValidationResult(False, errors=errors[:12], current_count=len(weather.forecast))
+        return AgentValidationResult(True, value=weather, current_count=len(weather.forecast))
+
+    def _validate_agent_hotel_research(
+        self,
+        candidate: HotelResearch,
+        candidate_pool: list[dict[str, Any]],
+        constraint_context: dict[str, Any],
+    ) -> AgentValidationResult:
+        errors: list[str] = []
+        catalog: dict[str, HotelOption] = {}
+        for item in candidate_pool:
+            try:
+                hotel = HotelOption.model_validate(item)
+            except Exception:
+                continue
+            if hotel.name and hotel.name not in catalog:
+                catalog[hotel.name] = hotel
+        if not catalog:
+            return AgentValidationResult(False, errors=["酒店 Agent 第二层验真失败：本轮 travel_search_hotels 工具候选池为空。"], current_count=0)
+        if not candidate.candidates:
+            errors.append("酒店 Agent 第二层验真失败：candidates 为空。")
+
+        grounded_candidates: list[HotelOption] = []
+        seen_names: set[str] = set()
+        for item in candidate.candidates:
+            resolved_name = self._resolve_place_name(item.name, catalog)
+            if not resolved_name and item.location.name:
+                resolved_name = self._resolve_place_name(item.location.name, catalog)
+            if not resolved_name:
+                errors.append(f"酒店 Agent 第二层验真失败：「{item.name}」不在 travel_search_hotels 工具候选池中。")
+                continue
+            canonical = catalog[resolved_name]
+            if canonical.name in seen_names:
+                errors.append(f"酒店 Agent 第二层验真失败：重复酒店「{canonical.name}」。")
+                continue
+            seen_names.add(canonical.name)
+            grounded_candidates.append(canonical)
+
+        recommended: HotelOption | None = None
+        if candidate.recommended_hotel is not None:
+            resolved = self._resolve_place_name(candidate.recommended_hotel.name, {hotel.name: hotel for hotel in grounded_candidates})
+            if not resolved:
+                errors.append("酒店 Agent 第二层验真失败：recommended_hotel 必须来自 candidates。")
+            else:
+                recommended = next(hotel for hotel in grounded_candidates if hotel.name == resolved)
+        elif grounded_candidates:
+            errors.append("酒店 Agent 第二层验真失败：recommended_hotel 不能为空，且必须来自 candidates。")
+
+        if errors:
+            return AgentValidationResult(False, errors=errors[:12], current_count=len(grounded_candidates))
+
+        reasoning = list(candidate.selection_reasoning or [])
+        reasoning.append("已通过第二层验真：酒店均来自 travel_search_hotels 工具候选池，并保留 Agent 自主选择的候选。")
+        return AgentValidationResult(
+            True,
+            value=HotelResearch(
+                candidates=grounded_candidates,
+                recommended_hotel=recommended or grounded_candidates[0],
+                selection_reasoning=reasoning,
+            ),
+            current_count=len(grounded_candidates),
+        )
+
+    def _validate_hotel_quantity(self, research: HotelResearch, target_count: int) -> AgentValidationResult:
+        current = len(research.candidates)
+        if current < target_count:
+            return AgentValidationResult(
+                False,
+                errors=[
+                    f"酒店 Agent 第三层数量校验失败：目标 {target_count} 个酒店，当前通过验真 {current} 个，还缺 {target_count - current} 个。请继续调用 travel_search_hotels，换 area_hint/search_focus 扩展候选池。"
+                ],
+                current_count=current,
+            )
+        if current > target_count:
+            return AgentValidationResult(
+                False,
+                errors=[f"酒店 Agent 第三层数量校验失败：目标 {target_count} 个酒店，但输出 {current} 个，不能超过目标数量。"],
+                current_count=current,
+            )
+        return AgentValidationResult(True, value=research, current_count=current)
+
+    def _validate_trip_plan_grounding(
+        self,
+        plan: TripPlan,
+        request: TravelRequest,
+        attractions: AttractionResearch,
+        hotels: HotelResearch,
+        restaurant_catalog: dict[str, list[RestaurantOption]],
+        constraint_context: dict[str, Any],
+        hotel_rotation_policy: dict[str, Any],
+    ) -> AgentValidationResult:
+        errors: list[str] = []
+        attraction_catalog = {item.name: item for item in attractions.selected_attractions}
+        hotel_catalog = {item.name: item for item in hotels.candidates}
+        if plan.trip_days != request.trip_days:
+            errors.append(f"最终 Agent 第三层数量校验失败：trip_days 应为 {request.trip_days}，实际 {plan.trip_days}。")
+        if len(plan.daily_plans) != request.trip_days:
+            errors.append(f"最终 Agent 第三层数量校验失败：daily_plans 应为 {request.trip_days} 天，实际 {len(plan.daily_plans)} 天。")
+        if len(plan.daily_stays) != request.trip_days:
+            errors.append(f"最终 Agent 第三层数量校验失败：daily_stays 应为 {request.trip_days} 天，实际 {len(plan.daily_stays)} 天。")
+
+        charged_count = sum(1 for stay in plan.daily_stays if stay.charged_night)
+        if charged_count != request.stay_nights:
+            errors.append(f"最终 Agent 第三层数量校验失败：charged_night=true 应为 {request.stay_nights} 晚，实际 {charged_count} 晚。")
+        if plan.daily_stays and plan.daily_stays[-1].charged_night and request.trip_days > 1:
+            errors.append("最终 Agent 第三层数量校验失败：最后一天通常不应新增住宿晚数，charged_night 应为 false。")
+
+        used_attractions: set[str] = set()
+        avoid_dining = constraint_context.get("keywords_to_avoid", {}).get("dining", []) or []
+        for day_index, day in enumerate(plan.daily_plans, start=1):
+            meal_count = 0
+            has_dinner_item = False
+            stay = plan.daily_stays[day_index - 1] if day_index - 1 < len(plan.daily_stays) else None
+            for item in day.items:
+                if item.item_type == "attraction":
+                    resolved = self._resolve_place_name(item.location_name or item.title, attraction_catalog)
+                    if not resolved:
+                        errors.append(f"最终 Agent 第二层验真失败：第 {day_index} 天景点「{item.location_name or item.title}」不在已验真的景点池中。")
+                    elif resolved in used_attractions:
+                        errors.append(f"最终 Agent 第二层验真失败：景点「{resolved}」被跨天重复安排。")
+                    else:
+                        used_attractions.add(resolved)
+                        attraction = attraction_catalog[resolved]
+                        item.location_name = resolved
+                        item.title = resolved
+                        item.location_address = attraction.location.address
+                elif item.item_type in {"meal", "food"}:
+                    meal_count += 1
+                    meal_text = f"{item.title} {item.location_name} {item.summary} {item.reason}"
+                    if any(marker in meal_text for marker in ("晚餐", "晚饭", "晚市", "夜宵", "dinner")):
+                        has_dinner_item = True
+                    violated = self._constraint_keyword_violations(meal_text, avoid_dining)
+                    if violated:
+                        errors.append(f"最终 Agent 第二层偏好/忌讳验真失败：第 {day_index} 天餐饮「{item.title}」命中忌讳关键词 {violated}。")
+                    if item.estimated_cost < 0:
+                        errors.append(f"最终 Agent 第一层/业务校验失败：第 {day_index} 天餐饮「{item.title}」estimated_cost 不能为负数。")
+                    resolved_anchor = self._resolve_route_anchor(
+                        item.location_name or item.title,
+                        attraction_catalog=attraction_catalog,
+                        hotel_catalog=hotel_catalog,
+                        restaurant_catalog={},
+                        region_candidates=self._collect_region_candidates(attractions, hotels, plan.daily_stays),
+                    )
+                    if not resolved_anchor and not item.is_route_stop:
+                        item.location_address = ""
+                elif item.item_type == "hotel":
+                    resolved = self._resolve_place_name(item.location_name or item.title, hotel_catalog)
+                    if not resolved:
+                        errors.append(f"最终 Agent 第二层验真失败：第 {day_index} 天换宿节点「{item.location_name or item.title}」不在已验真的酒店池中。")
+                elif item.item_type == "transport":
+                    errors.append("最终 Agent 第二层验真失败：最终 Agent 不应输出 transport item，交通由程序在最后注入。")
+            if day_index < request.trip_days:
+                if meal_count < 3:
+                    errors.append(f"最终 Agent 第三层数量校验失败：第 {day_index} 天至少需要早餐、午餐、晚餐 3 个餐饮 item，实际 {meal_count} 个。")
+            else:
+                if meal_count < 1:
+                    errors.append(f"最终 Agent 第三层数量校验失败：最后一天至少需要 1 个餐饮 item，实际 {meal_count} 个。")
+                if self._day_has_night_activity(day, stay) and not has_dinner_item:
+                    errors.append("最终 Agent 第三层数量校验失败：最后一天仍安排夜间活动或晚间交通，因此必须包含晚餐 item。")
+        for index, stay in enumerate(plan.daily_stays):
+            day_number = index + 1
+            if stay.day_index != day_number:
+                errors.append(f"最终 Agent 第三层数量校验失败：daily_stays[{index}].day_index 应为 {day_number}。")
+            for label, hotel in (("start_hotel", stay.start_hotel), ("end_hotel", stay.end_hotel)):
+                if hotel is None:
+                    errors.append(f"最终 Agent 第二层验真失败：第 {day_number} 天 {label} 不能为空，必须来自酒店候选池。")
+                    continue
+                resolved = self._resolve_place_name(hotel.name, hotel_catalog)
+                if not resolved:
+                    errors.append(f"最终 Agent 第二层验真失败：第 {day_number} 天 {label}「{hotel.name}」不在已验真的酒店池中。")
+                else:
+                    canonical = hotel_catalog[resolved]
+                    if label == "start_hotel":
+                        stay.start_hotel = canonical
+                    else:
+                        stay.end_hotel = canonical
+            if index > 0 and stay.start_hotel and plan.daily_stays[index - 1].end_hotel:
+                previous = plan.daily_stays[index - 1].end_hotel
+                if previous and stay.start_hotel.name != previous.name:
+                    errors.append(f"最终 Agent 第二层验真失败：第 {day_number} 天 start_hotel 应等于前一天 end_hotel。")
+            expected_changed = (
+                stay.charged_night
+                and stay.start_hotel is not None
+                and stay.end_hotel is not None
+                and stay.start_hotel.name != stay.end_hotel.name
+            )
+            if stay.hotel_changed != expected_changed:
+                errors.append(f"最终 Agent 第二层验真失败：第 {day_number} 天 hotel_changed 与 start_hotel/end_hotel 是否变化不一致。")
+
+        errors.extend(
+            self._hotel_rotation_sequence_errors(
+                plan.daily_stays,
+                request,
+                hotel_rotation_policy,
+                available_hotel_count=len(hotel_catalog),
+                label="最终 Agent",
+            )
+        )
+
+        if plan.recommended_hotel is not None:
+            resolved_hotel = self._resolve_place_name(plan.recommended_hotel.name, hotel_catalog)
+            if not resolved_hotel:
+                errors.append("最终 Agent 第二层验真失败：recommended_hotel 必须来自已验真的酒店池。")
+            else:
+                plan.recommended_hotel = hotel_catalog[resolved_hotel]
+        else:
+            errors.append("最终 Agent 第二层验真失败：recommended_hotel 不能为空，必须来自已验真的酒店池。")
+
+        budget_errors = self._validate_agent_budget(plan)
+        errors.extend(budget_errors)
+
+        if attractions.selected_attractions:
+            plan.selected_attractions = attractions.selected_attractions[:]
+        plan.hotel_candidates = hotels.candidates[:]
+
+        if errors:
+            return AgentValidationResult(False, errors=errors[:16], current_count=len(plan.daily_plans))
+        return AgentValidationResult(True, value=plan, current_count=len(plan.daily_plans))
+
+    def _validate_agent_budget(self, plan: TripPlan) -> list[str]:
+        errors: list[str] = []
+        budget = plan.budget
+        values = {
+            "hotel": budget.hotel,
+            "attractions": budget.attractions,
+            "food": budget.food,
+            "transport": budget.transport,
+            "contingency": budget.contingency,
+            "total": budget.total,
+        }
+        for key, value in values.items():
+            if value < 0:
+                errors.append(f"最终 Agent 第一层/业务校验失败：budget.{key} 不能为负数。")
+        subtotal = budget.hotel + budget.attractions + budget.food + budget.transport + budget.contingency
+        tolerance = max(20.0, subtotal * 0.08)
+        if abs(budget.total - subtotal) > tolerance:
+            errors.append(
+                f"最终 Agent 第二层预算验真失败：budget.total={budget.total} 与各项合计 {round(subtotal, 2)} 差距过大。"
+            )
+        return errors
+
+    def _hotel_rotation_sequence_errors(
+        self,
+        daily_stays: list[DailyStayPlan],
+        request: TravelRequest,
+        hotel_rotation_policy: dict[str, Any],
+        *,
+        available_hotel_count: int,
+        label: str,
+    ) -> list[str]:
+        errors: list[str] = []
+        hotel_names_by_charged_night = [
+            stay.end_hotel.name
+            for stay in daily_stays
+            if stay.charged_night and stay.end_hotel is not None
+        ]
+        target_hotel_count = int(hotel_rotation_policy.get("target_hotel_count", 1) or 1)
+        interval = int(hotel_rotation_policy.get("interval_nights", 2) or 2)
+        used_hotel_count = len(dict.fromkeys(hotel_names_by_charged_night))
+
+        if available_hotel_count >= target_hotel_count and used_hotel_count != target_hotel_count:
+            errors.append(f"{label} 第三层数量校验失败：按酒店轮换策略应使用 {target_hotel_count} 个不同酒店，实际使用 {used_hotel_count} 个。")
+
+        if used_hotel_count <= 1:
+            return errors
+
+        expected_group_count = math.ceil(request.stay_nights / interval) if interval else 1
+        group_hotels: list[str] = []
+        for group_index in range(expected_group_count):
+            start = group_index * interval
+            end = min(start + interval, len(hotel_names_by_charged_night))
+            names = hotel_names_by_charged_night[start:end]
+            if not names:
+                continue
+            unique_names = list(dict.fromkeys(names))
+            if len(unique_names) != 1:
+                errors.append(
+                    f"{label} 第三层数量校验失败：第 {group_index + 1} 个住宿组应连续住同一酒店，实际为 {unique_names}。"
+                )
+            group_hotels.append(unique_names[0])
+
+        for index in range(1, len(group_hotels)):
+            if group_hotels[index] == group_hotels[index - 1]:
+                errors.append(
+                    f"{label} 第三层数量校验失败：第 {index + 1} 个住宿组应按每 {interval} 晚换宿策略更换酒店。"
+                )
+        return errors
+
+    def _day_has_night_activity(self, day: DayPlan, stay: DailyStayPlan | None = None) -> bool:
+        markers = (
+            "夜间",
+            "夜游",
+            "夜市",
+            "夜生活",
+            "晚间",
+            "晚上",
+            "傍晚",
+            "夜景",
+            "夜宵",
+            "晚班",
+            "晚高峰",
+        )
+        text_parts = [day.route_summary]
+        if stay is not None:
+            text_parts.append(stay.reason)
+        for item in day.items:
+            text_parts.extend(
+                [
+                    item.time_range,
+                    item.title,
+                    item.location_name,
+                    item.summary,
+                    item.reason,
+                    item.from_location,
+                    item.to_location,
+                ]
+            )
+        text = " ".join(str(part or "") for part in text_parts)
+        if any(marker in text for marker in markers):
+            return True
+        for item in day.items:
+            if item.time_range and self._time_range_has_evening(item.time_range):
+                return True
+        return False
+
+    def _time_range_has_evening(self, value: str) -> bool:
+        for hour in range(18, 24):
+            if f"{hour:02d}:" in value or f"{hour}:" in value:
+                return True
+        return False
+
+    def _constraint_keyword_violations(self, text: str, keywords: list[str]) -> list[str]:
+        if not text:
+            return []
+        safe_markers = ("避开", "避免", "不含", "不加", "不要", "无辣", "少辣", "清淡", "非辣", "不辣")
+        violations: list[str] = []
+        for keyword in keywords:
+            if not keyword or keyword not in text:
+                continue
+            positions = [index for index in range(len(text)) if text.startswith(keyword, index)]
+            unsafe = False
+            for position in positions:
+                window = text[max(0, position - 8) : position + len(keyword) + 8]
+                if not any(marker in window for marker in safe_markers):
+                    unsafe = True
+                    break
+            if unsafe:
+                violations.append(keyword)
+        return violations
 
     def _normalize_preference_inputs(self, request: TravelRequest) -> TravelRequest:
         positive_parts = self._split_user_intent_text(request.extra_preferences)
@@ -614,235 +2101,6 @@ class TravelPlannerService:
             ],
         )
 
-    def _build_programmatic_plan(
-        self,
-        request: TravelRequest,
-        attractions: AttractionResearch,
-        weather: WeatherResearch,
-        hotels: HotelResearch,
-        restaurant_catalog: dict[str, list[RestaurantOption]],
-        *,
-        attraction_source: str,
-        weather_source: str,
-        hotel_source: str,
-    ) -> TripPlan:
-        selected = attractions.selected_attractions[: self._target_attraction_count(request)]
-        hotel = hotels.recommended_hotel or (hotels.candidates[0] if hotels.candidates else None)
-        route_target_catalog = self._build_route_target_catalog(attractions, hotels, restaurant_catalog)
-        attractions_per_day = self._attractions_per_day(request)
-        daily_plans: list[DayPlan] = []
-        attraction_cost = 0.0
-        food_cost = 0.0
-        transport_cost = 0.0
-
-        for index in range(request.trip_days):
-            current_date = request.start_date + timedelta(days=index)
-            weather_info = weather.forecast[min(index, len(weather.forecast) - 1)]
-            start = index * attractions_per_day
-            day_attractions = selected[start : start + attractions_per_day]
-            meal_candidates = self._choose_day_restaurants(
-                day_attractions,
-                hotel,
-                attractions.recommended_night_area,
-                restaurant_catalog,
-            )
-            breakfast_spot = meal_candidates[0] if meal_candidates else None
-            dinner_spot = meal_candidates[-1] if meal_candidates else None
-
-            items: list[DayPlanItem] = []
-            route_segments: list[RoutePlan] = []
-
-            if hotel:
-                breakfast_cost = (breakfast_spot.avg_cost_per_person if breakfast_spot else 20.0) * request.travelers
-                food_cost += breakfast_cost
-                items.append(
-                    DayPlanItem(
-                        time_range="08:30-09:00",
-                        title="酒店出发与早餐",
-                        item_type="meal",
-                        location_name=breakfast_spot.name if breakfast_spot else hotel.name,
-                        location_address=(
-                            breakfast_spot.location.address
-                            if breakfast_spot
-                            else hotel.location.address
-                        ),
-                        summary=(
-                            f"先在{breakfast_spot.nearby_anchor or hotel.nearby_area}附近安排早餐，再出发去首个景点。"
-                            if breakfast_spot
-                            else f"从{hotel.nearby_area}出发，先完成早餐与出门准备。"
-                        ),
-                        estimated_cost=round(breakfast_cost, 2),
-                        reason=(
-                            "早餐优先落到酒店或首段景点周边的真实餐饮候选，减少绕路。"
-                            if breakfast_spot
-                            else "以当前酒店为起点，更方便衔接当天首站。"
-                        ),
-                    )
-                )
-
-            for slot, attraction in enumerate(day_attractions):
-                start_hour = 9 + slot * 4
-                end_hour = start_hour + int(round(attraction.recommended_hours))
-                if slot == 0 and hotel:
-                    route_segments.append(
-                        self._build_route_plan(
-                            request.city,
-                            hotel.name,
-                            attraction.location.name,
-                            request.transport_mode,
-                            origin=self._route_target_for(hotel.name, route_target_catalog),
-                            destination=self._route_target_for(attraction.location.name, route_target_catalog),
-                        )
-                    )
-                items.append(
-                    DayPlanItem(
-                        time_range=f"{start_hour:02d}:30-{end_hour:02d}:00",
-                        title=attraction.name,
-                        item_type="attraction",
-                        location_name=attraction.location.name,
-                        location_address=attraction.location.address,
-                        summary=attraction.summary,
-                        estimated_cost=attraction.ticket_price * request.travelers,
-                        reason="根据偏好匹配度和当天路线平衡度选入。",
-                    )
-                )
-                attraction_cost += attraction.ticket_price * request.travelers
-                if slot + 1 < len(day_attractions):
-                    next_attraction = day_attractions[slot + 1]
-                    route_segments.append(
-                        self._build_route_plan(
-                            request.city,
-                            attraction.location.name,
-                            next_attraction.location.name,
-                            request.transport_mode,
-                            origin=self._route_target_for(attraction.location.name, route_target_catalog),
-                            destination=self._route_target_for(next_attraction.location.name, route_target_catalog),
-                        )
-                    )
-
-            dinner_cost = (dinner_spot.avg_cost_per_person if dinner_spot else 90.0) * request.travelers
-            food_cost += dinner_cost
-            items.append(
-                DayPlanItem(
-                    time_range="18:30-20:00",
-                    title="晚餐与夜间散步",
-                    item_type="food",
-                    location_name=dinner_spot.name if dinner_spot else attractions.recommended_night_area or "city center",
-                    location_address=dinner_spot.location.address if dinner_spot else "",
-                    summary=(
-                        f"在{dinner_spot.nearby_anchor or dinner_spot.location.address or dinner_spot.name}附近安排晚餐，并预留少量夜间散步时间。"
-                        if dinner_spot
-                        else "将晚间留给本地美食与轻量 city walk，便于灵活调整。"
-                    ),
-                    estimated_cost=round(dinner_cost, 2),
-                    reason=(
-                        "晚餐优先选在当天景点或夜生活区域周边的真实餐饮候选，方便收尾返程。"
-                        if dinner_spot
-                        else "符合美食与夜游节奏，也方便收尾返程。"
-                    ),
-                )
-            )
-
-            if day_attractions:
-                dinner_name = dinner_spot.name if dinner_spot else attractions.recommended_night_area or "city center"
-                route_segments.append(
-                    self._build_route_plan(
-                        request.city,
-                        day_attractions[-1].location.name,
-                        dinner_name,
-                        request.transport_mode,
-                        origin=self._route_target_for(day_attractions[-1].location.name, route_target_catalog),
-                        destination=self._route_target_for(dinner_name, route_target_catalog),
-                    )
-                )
-            if hotel:
-                dinner_name = dinner_spot.name if dinner_spot else attractions.recommended_night_area or "city center"
-                route_segments.append(
-                    self._build_route_plan(
-                        request.city,
-                        dinner_name,
-                        hotel.name,
-                        request.transport_mode,
-                        origin=self._route_target_for(dinner_name, route_target_catalog),
-                        destination=self._route_target_for(hotel.name, route_target_catalog),
-                    )
-                )
-
-            transport_items = self._route_items_for_day(route_segments)
-            items.extend(transport_items)
-            day_transport_cost = sum(segment.estimated_cost for segment in route_segments)
-            day_transport_time = sum(segment.duration_min for segment in route_segments)
-            transport_cost += day_transport_cost
-
-            route_summary = "、".join(item.title for item in items if item.item_type == "attraction")
-            daily_plans.append(
-                DayPlan(
-                    date=current_date,
-                    weather=weather_info,
-                    route_summary=(
-                        f"{route_summary or '当天安排灵活探索'} | "
-                        f"{self._transport_mode_label(request.transport_mode)}合计约{day_transport_time}分钟"
-                    ),
-                    items=items,
-                    total_transport_cost=round(day_transport_cost, 2),
-                    total_transport_time_min=day_transport_time,
-                )
-            )
-
-        hotel_cost = (hotel.nightly_price * request.stay_nights) if hotel else request.stay_nights * 360
-        contingency = round((hotel_cost + attraction_cost + food_cost + transport_cost) * 0.08, 2)
-        total = round(hotel_cost + attraction_cost + food_cost + transport_cost + contingency, 2)
-        budget = BudgetBreakdown(
-            hotel=round(hotel_cost, 2),
-            attractions=round(attraction_cost, 2),
-            food=round(food_cost, 2),
-            transport=round(transport_cost, 2),
-            contingency=contingency,
-            total=total,
-        )
-
-        labels = [PREFERENCE_LABELS.get(pref, pref) for pref in request.preferences]
-        risk_alerts = list(weather.risk_days)
-        shortage_note = self._attraction_shortage_note(request, selected)
-        if shortage_note:
-            risk_alerts.append(shortage_note)
-        if total > request.budget_max:
-            risk_alerts.append("当前方案超出预算上限，建议降低酒店档位或减少收费景点。")
-        if request.taboos:
-            risk_alerts.append(f"仍需人工复核负向约束：{request.taboos}")
-
-        return TripPlan(
-            city=request.city,
-            travel_theme=self._human_labels(labels) or "平衡型城市探索",
-            overview=f"这是一份 {request.trip_days} 天的{self._pace_label(request.pace)}行程，围绕{self._human_labels(labels) or '城市精华'}展开。",
-            trip_days=request.trip_days,
-            planning_source="program_fallback",
-            attraction_data_source=attraction_source,
-            weather_data_source=weather_source,
-            hotel_data_source=hotel_source,
-            attraction_search_plan=attractions.search_plan,
-            preference_interpretation=attractions.preference_interpretation,
-            agent_diagnostics=attractions.agent_diagnostics,
-            selected_attractions=selected,
-            recommended_hotel=hotel,
-            daily_plans=daily_plans,
-            budget=budget,
-            packing_tips=self._packing_tips(weather),
-            risk_alerts=risk_alerts,
-            notes=[
-                note
-                for note in [
-                    "优先使用实时地图与天气数据；缺失时自动回退到本地样例。",
-                    "酒店价格目前仍以 POI 候选和估算为主，不等于 OTA 实时报价。",
-                    "餐饮点会优先从当天景点、夜生活区域或酒店周边做真实 POI 检索。",
-                    f"每日交通建议按“{self._transport_mode_label(request.transport_mode)}”生成。",
-                    self._transport_note(request),
-                    shortage_note,
-                ]
-                if note
-            ],
-        )
-
     def _inject_transport_details(
         self,
         plan: TripPlan,
@@ -850,25 +2108,71 @@ class TravelPlannerService:
         attractions: AttractionResearch,
         hotels: HotelResearch,
         restaurant_catalog: dict[str, list[RestaurantOption]],
-        hotel: HotelOption | None,
-        night_area: str,
+        daily_stays: list[DailyStayPlan],
     ) -> None:
         route_target_catalog = self._build_route_target_catalog(attractions, hotels, restaurant_catalog)
-        for day in plan.daily_plans:
+        for index, day in enumerate(plan.daily_plans):
+            day_stay = self._stay_for_day(daily_stays, index, request)
             non_transport_items = [item for item in day.items if item.item_type != "transport"]
-            route_targets = self._collect_day_route_targets(non_transport_items, hotel, night_area, route_target_catalog)
+            non_transport_items = self._sort_day_items_by_time(non_transport_items)
+            route_targets = self._collect_day_route_targets(non_transport_items, day_stay, route_target_catalog)
             route_segments = self._build_day_route_segments(request, route_targets)
 
-            day.items = non_transport_items + self._route_items_for_day(route_segments)
+            day.items = self._interleave_transport_items(non_transport_items, route_segments)
             day.total_transport_cost = round(sum(segment.estimated_cost for segment in route_segments), 2)
             day.total_transport_time_min = sum(segment.duration_min for segment in route_segments)
             day.route_summary = self._refresh_day_route_summary(day, request)
 
+    def _sort_day_items_by_time(self, items: list[DayPlanItem]) -> list[DayPlanItem]:
+        return sorted(items, key=lambda item: self._time_sort_key(item.time_range))
+
+    def _interleave_transport_items(
+        self,
+        items: list[DayPlanItem],
+        route_segments: list[RoutePlan],
+    ) -> list[DayPlanItem]:
+        transport_items = self._route_items_for_day(route_segments)
+        if not transport_items:
+            return items
+
+        visible_route_origins = {
+            item.location_name
+            for item in items
+            if self._is_route_stop_item(item)
+        }
+        output: list[DayPlanItem] = []
+        route_index = 0
+        for item in items:
+            if self._is_route_stop_item(item):
+                while (
+                    route_index < len(transport_items)
+                    and transport_items[route_index].to_location == item.location_name
+                    and transport_items[route_index].from_location not in visible_route_origins
+                ):
+                    output.append(transport_items[route_index])
+                    route_index += 1
+
+            output.append(item)
+            if self._is_route_stop_item(item):
+                while (
+                    route_index < len(transport_items)
+                    and transport_items[route_index].from_location == item.location_name
+                ):
+                    output.append(transport_items[route_index])
+                    route_index += 1
+
+        output.extend(transport_items[route_index:])
+        return output
+
+    def _is_route_stop_item(self, item: DayPlanItem) -> bool:
+        if item.item_type in {"attraction", "hotel"}:
+            return True
+        return item.item_type in {"food", "meal"} and item.is_route_stop
+
     def _collect_day_route_targets(
         self,
         items: list[DayPlanItem],
-        hotel: HotelOption | None,
-        night_area: str,
+        stay: DailyStayPlan,
         route_target_catalog: dict[str, RouteTarget],
     ) -> list[RouteTarget]:
         ordered_targets: list[RouteTarget] = []
@@ -881,17 +2185,17 @@ class TravelPlannerService:
                 return
             ordered_targets.append(route_target_catalog.get(normalized, RouteTarget(normalized, address=address)))
 
-        if hotel:
-            push_target(hotel.name, hotel.location.address)
+        if stay.start_hotel is not None:
+            push_target(stay.start_hotel.name, stay.start_hotel.location.address)
 
         for item in items:
-            if item.item_type in {"attraction", "food", "meal"}:
+            if item.item_type in {"attraction", "hotel"}:
+                push_target(item.location_name, item.location_address)
+            elif item.item_type in {"food", "meal"} and item.is_route_stop:
                 push_target(item.location_name, item.location_address)
 
-        if hotel:
-            push_target(hotel.name, hotel.location.address)
-        elif night_area:
-            push_target(night_area)
+        if stay.charged_night and stay.end_hotel is not None:
+            push_target(stay.end_hotel.name, stay.end_hotel.location.address)
 
         return ordered_targets
 
@@ -917,6 +2221,62 @@ class TravelPlannerService:
                 )
             )
         return route_segments
+
+    def _stay_for_day(
+        self,
+        daily_stays: list[DailyStayPlan],
+        index: int,
+        request: TravelRequest | None = None,
+    ) -> DailyStayPlan:
+        if daily_stays:
+            return daily_stays[min(index, len(daily_stays) - 1)]
+        base_date = request.start_date if request is not None else self._date_for_index(0)
+        return DailyStayPlan(day_index=index + 1, date=base_date + timedelta(days=index))
+
+    def _date_for_index(self, index: int):
+        from datetime import date
+
+        return date.today() + timedelta(days=index)
+
+    def _calculate_hotel_cost(self, daily_stays: list[DailyStayPlan], request: TravelRequest) -> float:
+        charged = [
+            stay
+            for stay in daily_stays
+            if stay.charged_night and stay.end_hotel is not None
+        ][: request.stay_nights]
+        if not charged:
+            return request.stay_nights * 360
+        return round(sum(stay.end_hotel.nightly_price for stay in charged if stay.end_hotel is not None), 2)
+
+    def _refresh_plan_budget(
+        self,
+        plan: TripPlan,
+        request: TravelRequest,
+        daily_stays: list[DailyStayPlan],
+    ) -> None:
+        hotel_cost = self._calculate_hotel_cost(daily_stays, request)
+        attraction_cost = sum(
+            item.estimated_cost
+            for day in plan.daily_plans
+            for item in day.items
+            if item.item_type == "attraction"
+        )
+        food_cost = sum(
+            item.estimated_cost
+            for day in plan.daily_plans
+            for item in day.items
+            if item.item_type in {"food", "meal"}
+        )
+        transport_cost = sum(day.total_transport_cost for day in plan.daily_plans)
+        contingency = round((hotel_cost + attraction_cost + food_cost + transport_cost) * 0.08, 2)
+        plan.budget = BudgetBreakdown(
+            hotel=round(hotel_cost, 2),
+            attractions=round(attraction_cost, 2),
+            food=round(food_cost, 2),
+            transport=round(transport_cost, 2),
+            contingency=contingency,
+            total=round(hotel_cost + attraction_cost + food_cost + transport_cost + contingency, 2),
+        )
 
     def _build_route_target_catalog(
         self,
@@ -1113,15 +2473,22 @@ class TravelPlannerService:
     def _safe_pool_key(self, value: Any) -> str:
         return str(value or "").strip()
 
-    def _ground_hotel_research(
+    def _ground_agent_hotel_research(
         self,
         candidate: HotelResearch,
-        fallback: HotelResearch,
+        candidate_pool: list[dict[str, Any]],
     ) -> HotelResearch | None:
-        if not candidate.candidates and candidate.recommended_hotel is None:
+        catalog: dict[str, HotelOption] = {}
+        for item in candidate_pool:
+            try:
+                hotel = HotelOption.model_validate(item)
+            except Exception:
+                continue
+            if hotel.name and hotel.name not in catalog:
+                catalog[hotel.name] = hotel
+        if not catalog:
             return None
 
-        catalog = {item.name: item for item in fallback.candidates}
         grounded_candidates: list[HotelOption] = []
         for item in candidate.candidates:
             resolved_name = self._resolve_place_name(item.name, catalog)
@@ -1131,8 +2498,15 @@ class TravelPlannerService:
             if canonical.name not in {existing.name for existing in grounded_candidates}:
                 grounded_candidates.append(canonical)
 
-        if not grounded_candidates and fallback.recommended_hotel is not None:
-            grounded_candidates = [fallback.recommended_hotel]
+        if not grounded_candidates and candidate.recommended_hotel is not None:
+            resolved_name = self._resolve_place_name(candidate.recommended_hotel.name, catalog)
+            if resolved_name:
+                grounded_candidates.append(catalog[resolved_name])
+
+        for hotel in catalog.values():
+            if hotel.name not in {existing.name for existing in grounded_candidates}:
+                grounded_candidates.append(hotel)
+
         if not grounded_candidates:
             return None
 
@@ -1142,109 +2516,19 @@ class TravelPlannerService:
             if resolved_hotel:
                 recommended = catalog[resolved_hotel]
 
+        reasoning = list(candidate.selection_reasoning or [])
+        reasoning.append("酒店候选由 HotelSearchAgent 自主调用 travel_search_hotels 工具生成，并按工具候选池验真。")
         return HotelResearch(
             candidates=grounded_candidates,
             recommended_hotel=recommended,
-            selection_reasoning=candidate.selection_reasoning or fallback.selection_reasoning,
+            selection_reasoning=reasoning,
         )
-
-    def _ground_trip_plan(
-        self,
-        plan: TripPlan,
-        attractions: AttractionResearch,
-        hotels: HotelResearch,
-        restaurant_catalog: dict[str, list[RestaurantOption]],
-    ) -> TripPlan | None:
-        attraction_catalog = {item.name: item for item in attractions.selected_attractions}
-        hotel_catalog = {item.name: item for item in hotels.candidates}
-        restaurant_candidates = self._flatten_restaurant_catalog(restaurant_catalog)
-        region_candidates = self._collect_region_candidates(attractions, hotels)
-        hotel = hotels.recommended_hotel or (hotels.candidates[0] if hotels.candidates else None)
-        attraction_count = 0
-        unresolved_attractions = 0
-        used_attraction_names: set[str] = set()
-        removed_duplicate_attractions: list[str] = []
-
-        for day_index, day in enumerate(plan.daily_plans):
-            day_attractions_in_plan = [
-                attraction_catalog[item.location_name]
-                for item in day.items
-                if item.item_type == "attraction" and item.location_name in attraction_catalog
-            ]
-            day_restaurants = {
-                item.name: item
-                for item in self._choose_day_restaurants(
-                    day_attractions_in_plan,
-                    hotel,
-                    attractions.recommended_night_area,
-                    restaurant_catalog,
-                )
-            }
-            grounded_items: list[DayPlanItem] = []
-            for item in day.items:
-                if item.item_type == "attraction":
-                    attraction_count += 1
-                    resolved_name = self._resolve_place_name(item.location_name or item.title, attraction_catalog)
-                    if not resolved_name:
-                        unresolved_attractions += 1
-                        continue
-                    if resolved_name in used_attraction_names:
-                        removed_duplicate_attractions.append(resolved_name)
-                        continue
-                    used_attraction_names.add(resolved_name)
-                    attraction = attraction_catalog[resolved_name]
-                    item.location_name = resolved_name
-                    item.title = resolved_name
-                    item.location_address = attraction.location.address
-                    grounded_items.append(item)
-                    continue
-
-                if item.item_type in {"food", "meal"}:
-                    resolved_location = self._resolve_route_anchor(
-                        item.location_name or item.title,
-                        attraction_catalog=attraction_catalog,
-                        hotel_catalog=hotel_catalog,
-                        restaurant_catalog=day_restaurants or restaurant_candidates,
-                        region_candidates=region_candidates,
-                    )
-                    if resolved_location:
-                        item.location_name = resolved_location
-                    item.location_address = self._resolve_location_address(
-                        item.location_name or item.title,
-                        attraction_catalog=attraction_catalog,
-                        hotel_catalog=hotel_catalog,
-                        restaurant_catalog=day_restaurants or restaurant_candidates,
-                    )
-                grounded_items.append(item)
-            day.items = grounded_items
-
-        if attraction_count and unresolved_attractions:
-            return None
-
-        if hotels.recommended_hotel is not None:
-            if plan.recommended_hotel is not None:
-                resolved_hotel = self._resolve_place_name(plan.recommended_hotel.name, hotel_catalog)
-                if not resolved_hotel:
-                    return None
-            plan.recommended_hotel = hotels.recommended_hotel
-
-        if attractions.selected_attractions:
-            plan.selected_attractions = attractions.selected_attractions[:]
-        if removed_duplicate_attractions:
-            unique_removed = []
-            for name in removed_duplicate_attractions:
-                if name not in unique_removed:
-                    unique_removed.append(name)
-            plan.notes.append(
-                "已移除跨天重复景点：" + "、".join(unique_removed[:8]) + "。"
-            )
-
-        return plan
 
     def _collect_region_candidates(
         self,
         attractions: AttractionResearch,
         hotels: HotelResearch,
+        daily_stays: list[DailyStayPlan] | None = None,
     ) -> list[str]:
         candidates: list[str] = []
 
@@ -1258,94 +2542,13 @@ class TravelPlannerService:
             add(hotels.recommended_hotel.nearby_area)
         for hotel in hotels.candidates:
             add(hotel.nearby_area)
+        for stay in daily_stays or []:
+            add(stay.night_area)
+            if stay.start_hotel is not None:
+                add(stay.start_hotel.nearby_area)
+            if stay.end_hotel is not None:
+                add(stay.end_hotel.nearby_area)
         return candidates
-
-    def _build_restaurant_catalog(
-        self,
-        request: TravelRequest,
-        attractions: AttractionResearch,
-        hotels: HotelResearch,
-    ) -> dict[str, list[RestaurantOption]]:
-        anchors: list[str] = []
-        for attraction in attractions.selected_attractions[: max(request.trip_days * 2, 4)]:
-            self._append_unique_anchor(anchors, attraction.location.name)
-        if attractions.recommended_night_area:
-            self._append_unique_anchor(anchors, attractions.recommended_night_area)
-        if hotels.recommended_hotel is not None:
-            self._append_unique_anchor(anchors, hotels.recommended_hotel.name)
-            self._append_unique_anchor(anchors, hotels.recommended_hotel.nearby_area)
-
-        catalog: dict[str, list[RestaurantOption]] = {}
-        budget_hint = max(request.budget_max / max(request.trip_days, 1), 120)
-        for anchor in anchors:
-            try:
-                payload = self.backend.search_restaurants(
-                    city=request.city,
-                    anchor=anchor,
-                    preferences=",".join(request.preferences),
-                    budget_hint=budget_hint,
-                    travelers=request.travelers,
-                    radius_m=1800,
-                )
-            except Exception:
-                continue
-            options: list[RestaurantOption] = []
-            for item in (payload.get("restaurants") or []):
-                try:
-                    options.append(RestaurantOption.model_validate(item))
-                except Exception:
-                    continue
-            if options:
-                catalog[anchor] = options
-        return catalog
-
-    def _build_meal_research(
-        self,
-        request: TravelRequest,
-        attractions: AttractionResearch,
-        hotels: HotelResearch,
-        restaurant_catalog: dict[str, list[RestaurantOption]],
-    ) -> MealResearch:
-        hotel = hotels.recommended_hotel or (hotels.candidates[0] if hotels.candidates else None)
-        selected = attractions.selected_attractions[: self._target_attraction_count(request)]
-        attractions_per_day = self._attractions_per_day(request)
-        day_candidates: list[DayMealResearch] = []
-        general_candidates = list(self._flatten_restaurant_catalog(restaurant_catalog).values())[:10]
-
-        for index in range(request.trip_days):
-            current_date = request.start_date + timedelta(days=index)
-            start = index * attractions_per_day
-            day_attractions = selected[start : start + attractions_per_day]
-            anchors = self._collect_day_meal_anchors(day_attractions, hotel, attractions.recommended_night_area)
-            candidates = self._choose_day_restaurants(
-                day_attractions,
-                hotel,
-                attractions.recommended_night_area,
-                restaurant_catalog,
-            )
-            day_candidates.append(
-                DayMealResearch(
-                    day_index=index + 1,
-                    date=current_date,
-                    anchors=anchors,
-                    candidates=candidates,
-                    dining_strategy=(
-                        "优先选择当天景点周边的真实餐饮 POI，晚餐尽量靠近夜生活区域或回酒店顺路位置。"
-                    ),
-                )
-            )
-
-        notes = [
-            "早餐和晚餐优先使用真实餐饮候选，避免只写模糊片区名。",
-            "如果当天候选不足，可以回退到 recommended_night_area 或酒店 nearby_area 作为稳定锚点。",
-        ]
-        return MealResearch(
-            city=request.city,
-            city_summary="餐饮候选按当天景点、夜生活区域和酒店周边进行真实 POI 检索与整理。",
-            day_candidates=day_candidates,
-            general_candidates=general_candidates,
-            planning_notes=notes,
-        )
 
     def _attractions_per_day(self, request: TravelRequest) -> int:
         return {
@@ -1354,74 +2557,24 @@ class TravelPlannerService:
             "intense": 3,
         }.get(request.pace, 2)
 
+    def _repair_attraction_tool_budget(self, target_count: int, current_count: int) -> int:
+        shortage = max(target_count - current_count, 0)
+        if shortage <= 0:
+            return 0
+        return min(max(math.ceil(shortage / 2), 2), 8)
+
     def _target_attraction_count(self, request: TravelRequest) -> int:
         return max(request.trip_days * self._attractions_per_day(request), 3)
 
-    def _attraction_shortage_note(self, request: TravelRequest, selected: list[Attraction]) -> str:
-        target = self._target_attraction_count(request)
-        if len(selected) >= target:
-            return ""
-        return (
-            f"真实可用景点候选不足：按当前节奏预计需要约 {target} 个不重复景点，"
-            f"本次只获得 {len(selected)} 个；后续日期会减少景点密度，不自动重复已安排景点。"
-        )
-
-    def _collect_day_meal_anchors(
-        self,
-        day_attractions: list[Attraction],
-        hotel: HotelOption | None,
-        night_area: str,
-    ) -> list[str]:
-        anchors: list[str] = []
-        if hotel is not None:
-            self._append_unique_anchor(anchors, hotel.name)
-            self._append_unique_anchor(anchors, hotel.nearby_area)
-        for attraction in day_attractions:
-            self._append_unique_anchor(anchors, attraction.location.name)
-        self._append_unique_anchor(anchors, night_area)
-        return anchors
-
-    def _append_unique_anchor(self, anchors: list[str], value: str) -> None:
-        cleaned = self._sanitize_place_name(value)
-        if cleaned and cleaned not in anchors:
-            anchors.append(cleaned)
-
-    def _choose_day_restaurants(
-        self,
-        day_attractions: list[Attraction],
-        hotel: HotelOption | None,
-        night_area: str,
-        restaurant_catalog: dict[str, list[RestaurantOption]],
-    ) -> list[RestaurantOption]:
-        selected: list[RestaurantOption] = []
-        seen: set[str] = set()
-        anchors: list[str] = []
-        if hotel is not None:
-            self._append_unique_anchor(anchors, hotel.name)
-            self._append_unique_anchor(anchors, hotel.nearby_area)
-        for attraction in day_attractions:
-            self._append_unique_anchor(anchors, attraction.location.name)
-        self._append_unique_anchor(anchors, night_area)
-
-        for anchor in anchors:
-            for option in restaurant_catalog.get(anchor, []):
-                if option.name in seen:
-                    continue
-                selected.append(option)
-                seen.add(option.name)
-                if len(selected) >= 4:
-                    return selected
-        return selected
-
-    def _flatten_restaurant_catalog(
-        self,
-        restaurant_catalog: dict[str, list[RestaurantOption]],
-    ) -> dict[str, RestaurantOption]:
-        flattened: dict[str, RestaurantOption] = {}
-        for options in restaurant_catalog.values():
-            for option in options:
-                flattened.setdefault(option.name, option)
-        return flattened
+    def _expected_daily_attraction_counts(self, request: TravelRequest, available_count: int) -> list[int]:
+        if request.trip_days <= 0:
+            return []
+        per_day = self._attractions_per_day(request)
+        total = min(max(available_count, 0), request.trip_days * per_day)
+        counts = [0 for _ in range(request.trip_days)]
+        for index in range(total):
+            counts[index % request.trip_days] += 1
+        return counts
 
     def _resolve_route_anchor(
         self,

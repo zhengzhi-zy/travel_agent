@@ -22,6 +22,19 @@ class BaseWorkflowAgent:
             max_tool_iterations=max_tool_iterations,
         )
 
+    def run_json_with_trace(
+        self,
+        user_prompt: str,
+        max_tool_iterations: int = 2,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        return self.runtime.run_json_with_trace(
+            name=self.name,
+            system_prompt=self.system_prompt,
+            user_prompt=user_prompt,
+            tool_registry=self.tool_registry,
+            max_tool_iterations=max_tool_iterations,
+        )
+
     def run_text(self, user_prompt: str, max_tool_iterations: int = 2) -> str:
         return self.runtime.run_simple(
             name=self.name,
