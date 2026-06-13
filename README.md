@@ -158,11 +158,6 @@ http://127.0.0.1:8010
 | `POST` | `/api/plan/tasks` | 创建异步规划任务 |
 | `GET` | `/api/plan/stream/{task_id}` | 通过 Server-Sent Events 返回进度和最终结果 |
 
-### 数据与安全
-
-- `.env`、`.venv/`、`.idea/`、`data/`、`memory/`、`skills/` 和 `tool-output/` 已加入 `.gitignore`。
-- API Key 只应写入本地 `.env`，不要提交到仓库。
-- `.env.example` 只保留变量名和空值，用于说明配置格式。
 
 ---
 
@@ -289,8 +284,4 @@ If `PORT` is changed in `.env`, use that port instead.
 | `POST` | `/api/plan/tasks` | Create an asynchronous planning task |
 | `GET` | `/api/plan/stream/{task_id}` | Stream progress and final result through Server-Sent Events |
 
-### Data and Security
 
-- `.env`, `.venv/`, `.idea/`, `data/`, `memory/`, `skills/`, and `tool-output/` are ignored by Git.
-- API keys should stay in the local `.env` file and must not be committed.
-- `.env.example` documents configuration names without secrets.
