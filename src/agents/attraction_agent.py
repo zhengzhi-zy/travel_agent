@@ -16,7 +16,8 @@ class AttractionSearchAgent(BaseWorkflowAgent):
         "调用 travel_search_attraction_pois 时，query 必须是一个具体中文搜索词，例如：滨水公园、博物馆、美食街、亲子乐园。"
         "不要把所有偏好一次性塞进 query。"
         "工具调用有程序侧配额限制；优先覆盖不同偏好主题，而不是反复搜索同一类词。"
-        "最终 selected_attractions 只能来自工具返回的 candidates，必须复制 candidate_id、name、address、lat、lng。"
+        "工具只会返回精简候选；完整地址和坐标由后端保存并补全。"
+        "最终 selected_attractions 只能来自工具返回的 candidates，只需要复制 candidate_id 和 name，并给出分数与理由。"
         "selected_attractions 里不要重复同一个景点；长天数旅行要尽量选择足够多的不重复景点。"
         "如果候选和用户忌讳冲突，必须拒绝并在 selection_reasoning 说明。"
         "你必须只输出一个 JSON 对象，不要输出 Markdown、代码块、解释文字或多余前后缀。"
@@ -91,7 +92,7 @@ class AttractionSearchAgent(BaseWorkflowAgent):
 {self._json(previous_data or {})}
 
 返工要求：
-- 如果是 JSON 结构错误，请重新输出完整 AttractionResearch JSON。
+- 如果是 JSON 结构错误，请重新输出完整 AttractionSelectionResearch JSON。
 - 如果是验真错误，只能从工具 candidates 中选择景点，不要编造景点、地址、坐标或 candidate_id。
 - 如果是数量不足，你必须继续调用 travel_search_attraction_pois，使用和已有候选不同的具体 query 扩展候选池。
 - 新增景点不能和已通过验真的景点重复。
@@ -154,6 +155,7 @@ class AttractionSearchAgent(BaseWorkflowAgent):
 - 忌讳要分作用范围：例如“不吃辣”主要影响餐饮；“不想爬山”会影响景点。
 - 对每个候选进行 Agent 打分，分数和理由由你判断。
 - 只能选择工具返回过的候选；不要创造新景点。
+- 工具返回给你的候选是精简版；你不要输出地址、坐标、门票等事实字段，后端会用 candidate_id 回查完整候选。
 - selected_attractions 不要重复同名景点。
 - 如果工具候选数量足够，selected_attractions 必须达到 {target_count} 个。
 - 如果候选不足，必须继续换 query 调用工具扩展候选池，直到达到目标或工具返回调用上限。
@@ -184,23 +186,11 @@ class AttractionSearchAgent(BaseWorkflowAgent):
   "selected_attractions": [
     {{
       "candidate_id": "must copy from tool candidate",
-      "source_query": "must copy from tool candidate",
+      "name": "must copy exact candidate name",
       "score": 90,
       "matched_preferences": ["string"],
       "taboo_check": "string",
-      "name": "string",
-      "category": "string",
-      "tags": ["string"],
-      "summary": "string",
-      "recommended_hours": 2.0,
-      "ticket_price": 0.0,
-      "best_time": "morning",
-      "location": {{
-        "name": "string",
-        "address": "string",
-        "lat": 0.0,
-        "lng": 0.0
-      }}
+      "reason": "why this candidate fits the user"
     }}
   ],
   "selection_reasoning": ["string"],

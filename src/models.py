@@ -121,6 +121,27 @@ class Attraction(BaseModel):
     location: Location
 
 
+class AttractionSelection(BaseModel):
+    candidate_id: str = ""
+    name: str
+    score: float = 0.0
+    matched_preferences: list[str] = Field(default_factory=list)
+    taboo_check: str = ""
+    reason: str = ""
+
+    @field_validator("candidate_id", "name", "taboo_check", "reason", mode="before")
+    @classmethod
+    def normalize_text(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (list, tuple, set)):
+            parts = [str(item).strip() for item in value if str(item).strip()]
+            return " ".join(parts)
+        return str(value).strip()
+
+
 class WeatherInfo(BaseModel):
     date: date
     condition: str
@@ -151,6 +172,19 @@ class HotelOption(BaseModel):
         if isinstance(value, (list, tuple, set)):
             parts = [str(item).strip() for item in value if str(item).strip()]
             return " ".join(parts)
+        return str(value).strip()
+
+
+class HotelSelectionResearch(BaseModel):
+    candidate_names: list[str] = Field(default_factory=list)
+    recommended_hotel_name: str
+    selection_reasoning: list[str] = Field(default_factory=list)
+
+    @field_validator("recommended_hotel_name", mode="before")
+    @classmethod
+    def normalize_text(cls, value: Any) -> str:
+        if value is None:
+            return ""
         return str(value).strip()
 
 
@@ -296,6 +330,16 @@ class DayPlan(BaseModel):
 class AttractionResearch(BaseModel):
     city_overview: str
     selected_attractions: list[Attraction] = Field(default_factory=list)
+    selection_reasoning: list[str] = Field(default_factory=list)
+    recommended_night_area: str = ""
+    search_plan: list[dict[str, Any]] = Field(default_factory=list)
+    preference_interpretation: dict[str, Any] = Field(default_factory=dict)
+    agent_diagnostics: dict[str, Any] = Field(default_factory=dict)
+
+
+class AttractionSelectionResearch(BaseModel):
+    city_overview: str = ""
+    selected_attractions: list[AttractionSelection] = Field(default_factory=list)
     selection_reasoning: list[str] = Field(default_factory=list)
     recommended_night_area: str = ""
     search_plan: list[dict[str, Any]] = Field(default_factory=list)

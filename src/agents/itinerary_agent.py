@@ -25,6 +25,7 @@ class ItineraryPlanningAgent(BaseWorkflowAgent):
         "你是最终行程规划 Agent 的单日规划阶段。"
         "你只负责基于当天固定住宿、固定景点和天气生成一个 DayPlan JSON。"
         "你可以自主生成早餐、午餐、晚餐的餐饮意图和预算，但不要编造具体餐厅名或地址。"
+        "当天上下文是精简目录；完整地址、门票和经纬度由后端补全。"
         "你不能新增景点或酒店，不能输出住宿选择、hotel item、transport item 或完整 TripPlan。"
         "你必须只输出一个 JSON 对象，不要输出 Markdown、代码块、解释文字或多余前后缀。"
     )
@@ -427,8 +428,8 @@ TravelRequest:
 - 景点 item 的 item_type 必须是 "attraction"。
 - 景点 title 和 location_name 必须逐字复制 day_context.assigned_attractions.name。
 - 必须且只能安排 day_context.assigned_attractions 中给定的景点，不能新增、删除、重复或改写。
-- 景点 location_address 必须复制 day_context.assigned_attractions.location.address。
-- 景点 estimated_cost 使用 day_context.assigned_attractions.ticket_price。
+- 景点 location_address 可以填 day_context.assigned_attractions.address；后端会按已验真景点池覆盖为完整地址。
+- 景点 estimated_cost 可以填 day_context.assigned_attractions.ticket_price；后端会按已验真景点池覆盖为真实门票。
 - 餐饮不要放进 items；餐饮必须放进 meal_intents。
 - {meal_rule}
 - meal_type 只能是 "breakfast"、"lunch"、"dinner"，不要输出 snack。
@@ -496,7 +497,7 @@ TravelRequest:
       "title": "copy exact assigned attraction name",
       "item_type": "attraction",
       "location_name": "copy exact assigned attraction name",
-      "location_address": "copy exact assigned attraction address",
+      "location_address": "copy assigned attraction address or empty",
       "summary": "string",
       "estimated_cost": 0.0,
       "reason": "string"
@@ -510,9 +511,8 @@ TravelRequest:
             return "- 当前没有可选景点候选；不要自行新增景点。"
         lines: list[str] = []
         for index, attraction in enumerate(attractions.selected_attractions, start=1):
-            address = attraction.location.address or "暂无详细地址"
             lines.append(
-                f"{index}. {attraction.name} | 门票 ¥{attraction.ticket_price:.0f} | 建议 {attraction.recommended_hours:g} 小时 | 地址：{address}"
+                f"{index}. {attraction.name}"
             )
         return "\n".join(lines)
 
@@ -530,10 +530,8 @@ TravelRequest:
                         f"ticket_price: {attraction.ticket_price:.0f}",
                         f"recommended_hours: {attraction.recommended_hours:g}",
                         f"best_time: {attraction.best_time}",
-                        f"address: {attraction.location.address}",
-                        f"lat: {attraction.location.lat}",
-                        f"lng: {attraction.location.lng}",
-                        f"summary: {attraction.summary}",
+                        f"address_hint: {attraction.location.address}",
+                        f"summary: {self._short_text(attraction.summary, 80)}",
                     ]
                 )
             )
@@ -545,7 +543,7 @@ TravelRequest:
         lines: list[str] = []
         for index, hotel in enumerate(hotels.candidates, start=1):
             lines.append(
-                f"{index}. {hotel.name} | 每晚 ¥{hotel.nightly_price:.0f} | 区域：{hotel.nearby_area}"
+                f"{index}. {hotel.name}"
             )
         return "\n".join(lines)
 
@@ -562,18 +560,19 @@ TravelRequest:
                         f"style: {hotel.style}",
                         f"star_level: {hotel.star_level}",
                         f"nightly_price: {hotel.nightly_price:.0f}",
-                        f"price_source: {hotel.price_source}",
-                        f"booking_url: {hotel.booking_url}",
-                        f"summary: {hotel.summary}",
                         f"nearby_area: {hotel.nearby_area}",
-                        f"location.name: {hotel.location.name}",
-                        f"location.address: {hotel.location.address}",
-                        f"location.lat: {hotel.location.lat}",
-                        f"location.lng: {hotel.location.lng}",
+                        f"address_hint: {hotel.location.address}",
+                        f"summary: {self._short_text(hotel.summary, 80)}",
                     ]
                 )
             )
         return "\n\n".join(blocks)
+
+    def _short_text(self, value: Any, limit: int) -> str:
+        text = str(value or "").strip()
+        if len(text) <= limit:
+            return text
+        return text[: max(limit - 1, 0)] + "…"
 
     def _json(self, value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, indent=2, default=str)

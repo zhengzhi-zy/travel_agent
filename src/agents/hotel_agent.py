@@ -15,6 +15,8 @@ class HotelSearchAgent(BaseWorkflowAgent):
         "调用酒店工具时，只能使用这些参数名："
         "city, budget_min, budget_max, travelers, stay_nights, hotel_style, limit, area_hint, search_focus。"
         "不要使用 total_budget、stay_length、style 之类的别名。"
+        "工具只会返回精简候选；完整地址、坐标和详情由后端保存并补全。"
+        "你只需要输出 candidate_names 和 recommended_hotel_name，不要复制完整酒店对象。"
         "你必须只输出一个 JSON 对象，不要输出 Markdown、代码块、解释文字或多余前后缀。"
         "字段名、字段层级和字段类型必须完全符合用户给出的模板，不能省略字段。"
     )
@@ -43,7 +45,7 @@ class HotelSearchAgent(BaseWorkflowAgent):
         )
         if data:
             diagnostics["json_keys"] = list(data.keys())
-            diagnostics["raw_candidate_count"] = len(data.get("candidates") or [])
+            diagnostics["raw_candidate_count"] = len(data.get("candidate_names") or [])
         return data, diagnostics
 
     def repair(
@@ -80,11 +82,11 @@ class HotelSearchAgent(BaseWorkflowAgent):
 {self._json(previous_data or {})}
 
 返工要求：
-- 如果是 JSON 结构错误，请重新输出完整 HotelResearch JSON。
-- 如果是验真错误，candidates 只能来自工具 candidates，不要编造酒店、地址、坐标或价格。
+- 如果是 JSON 结构错误，请重新输出完整 HotelSelectionResearch JSON。
+- 如果是验真错误，candidate_names 只能来自工具 candidates，不要编造酒店、地址、坐标或价格。
 - 如果是数量不足，你必须继续调用 travel_search_hotels，增大 limit，并使用不同 area_hint/search_focus 扩展候选池。
 - 新增酒店不能和已通过验真的酒店重复。
-- recommended_hotel 必须来自 candidates。
+- recommended_hotel_name 必须来自 candidate_names。
 - 如果工具调用次数已达上限但仍不足，只能输出所有已验真的不重复酒店，并在 selection_reasoning 说明无法达到目标数量。
 - 仍然必须遵守用户偏好和忌讳，例如安静、少走路、夜生活、美食、预算等住宿相关约束。
 - 只输出一个 JSON 对象，不要 Markdown，不要解释。
@@ -105,7 +107,7 @@ class HotelSearchAgent(BaseWorkflowAgent):
         )
         if data:
             diagnostics["json_keys"] = list(data.keys())
-            diagnostics["raw_candidate_count"] = len(data.get("candidates") or [])
+            diagnostics["raw_candidate_count"] = len(data.get("candidate_names") or [])
         return data, diagnostics
 
     def _build_prompt(
@@ -152,11 +154,12 @@ travel_search_hotels(
 - 不要传 total_budget
 - 不要传 stay_length
 - 不要传 style
-- candidates 必须来自工具返回结果，不要编造酒店名称、地址或价格
-- 如果工具候选数量足够，candidates 必须输出 {target_hotel_count} 个不同酒店
+- candidate_names 必须来自工具返回结果，不要编造酒店名称、地址或价格
+- 如果工具候选数量足够，candidate_names 必须输出 {target_hotel_count} 个不同酒店
 - 如果候选不足，必须继续换 area_hint/search_focus 调用工具扩展候选池
 - 如果工具最终不足，只能输出所有可验真的不重复酒店，并在 selection_reasoning 说明不足原因
-- recommended_hotel 必须来自 candidates
+- recommended_hotel_name 必须来自 candidate_names
+- 不要输出完整酒店对象；后端会按酒店名称从完整候选池补全价格、地址、坐标和 summary
 - 必须遵守用户统一约束上下文；例如不想吵就避开过度夜生活区域，不想走路就优先交通方便/靠近景点集群
 
 严格 JSON 输出规则：
@@ -167,40 +170,8 @@ travel_search_hotels(
 
 返回 JSON：
 {{
-  "candidates": [
-    {{
-      "name": "string",
-      "style": "comfort",
-      "star_level": 4,
-      "nightly_price": 480.0,
-      "price_source": "estimated_from_poi",
-      "booking_url": "",
-      "summary": "string",
-      "nearby_area": "string",
-      "location": {{
-        "name": "string",
-        "address": "string",
-        "lat": 0.0,
-        "lng": 0.0
-      }}
-    }}
-  ],
-  "recommended_hotel": {{
-    "name": "string",
-    "style": "comfort",
-    "star_level": 4,
-    "nightly_price": 480.0,
-    "price_source": "estimated_from_poi",
-    "booking_url": "",
-    "summary": "string",
-    "nearby_area": "string",
-    "location": {{
-      "name": "string",
-      "address": "string",
-      "lat": 0.0,
-      "lng": 0.0
-    }}
-  }},
+  "candidate_names": ["copy exact hotel candidate name"],
+  "recommended_hotel_name": "copy exact hotel candidate name",
   "selection_reasoning": ["string"]
 }}
 """
